@@ -1,3 +1,5 @@
+Cynosure C2
+
 AI-Driven Malware Payload Generator & Go C2 Framework
 
 Overview
