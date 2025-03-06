@@ -1,4 +1,4 @@
-![Cynosure](https://github.com/ConnorDedic/Cynosure/Media/logo.png)
+![Cynosure](https://github.com/ConnorDedic/Cynosure/blob/master/Media/logo.png)
 AI-Driven Malware Payload Generator & Go C2 Framework
 
 Overview
