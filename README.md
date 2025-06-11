@@ -1,21 +1,3 @@
-
-
- ▄████▄▓██   ██▓ ███▄    █  ▒█████    ██████  █    ██  ██▀███  ▓█████ 
-▒██▀ ▀█ ▒██  ██▒ ██ ▀█   █ ▒██▒  ██▒▒██    ▒  ██  ▓██▒▓██ ▒ ██▒▓█   ▀ 
-▒▓█    ▄ ▒██ ██░▓██  ▀█ ██▒▒██░  ██▒░ ▓██▄   ▓██  ▒██░▓██ ░▄█ ▒▒███   
-▒▓▓▄ ▄██▒░ ▐██▓░▓██▒  ▐▌██▒▒██   ██░  ▒   ██▒▓▓█  ░██░▒██▀▀█▄  ▒▓█  ▄ 
-▒ ▓███▀ ░░ ██▒▓░▒██░   ▓██░░ ████▓▒░▒██████▒▒▒▒█████▓ ░██▓ ▒██▒░▒████▒
-░ ░▒ ▒  ░ ██▒▒▒ ░ ▒░   ▒ ▒ ░ ▒░▒░▒░ ▒ ▒▓▒ ▒ ░░▒▓▒ ▒ ▒ ░ ▒▓ ░▒▓░░░ ▒░ ░
-  ░  ▒  ▓██ ░▒░ ░ ░░   ░ ▒░  ░ ▒ ▒░ ░ ░▒  ░ ░░░▒░ ░ ░   ░▒ ░ ▒░ ░ ░  ░
-░       ▒ ▒ ░░     ░   ░ ░ ░ ░ ░ ▒  ░  ░  ░   ░░░ ░ ░   ░░   ░    ░   
-░ ░     ░ ░              ░     ░ ░        ░     ░        ░        ░  ░
-░       ░ ░                                                           
-
-
-
-
-
-
 ## Adaptive C2 Channel with AI Obfuscation
 
 This project develops an intelligent Command and Control (C2) system designed to dynamically alter its communication patterns, aiming to evade detection by security systems. By integrating basic AI/ML principles, the C2 channel will learn from "detection feedback" and adapt its obfuscation methods in real time, enhancing its resilience and stealth in simulated red team scenarios.
