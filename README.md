@@ -1,6 +1,6 @@
-## Cynosure C2
-
-The purpose of a C2 is to control and organize implants. But is a human always there? Is a human the fastest to react if there is a scan? What if the implant gets noticed? What if the SIEM notices the beacons when the user isn't even at work?
-
-
-Why have the humans do the computers job?
+  .,-:::::  .-:.     ::-.:::.    :::.    ...      .::::::.  ...    ::::::::::..   .,::::::  
+,;;;'````'   ';;.   ;;;;'`;;;;,  `;;; .;;;;;;;.  ;;;`    `  ;;     ;;;;;;;``;;;;  ;;;;''''  
+[[[            '[[,[[['    [[[[[. '[[,[[     \[[,'[==/[[[[,[['     [[[ [[[,/[[['   [[cccc   
+$$$              c$$"      $$$ "Y$c$$$$$,     $$$  '''    $$$      $$$ $$$$$$c     $$""""   
+`88bo,__,o,    ,8P"`       888    Y88"888,_ _,88P 88b    dP88    .d888 888b "88bo, 888oo,__ 
+  "YUMMMMMP"  mM"          MMM     YM  "YMMMMMP"   "YMmMY"  "YmmMMMM"" MMMM   "W"  """"YUMMM
