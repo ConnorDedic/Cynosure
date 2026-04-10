@@ -25,11 +25,21 @@ This will be a ML empowered modular C2
         - Encrypted Memory Loader
 
 
-
-
-
-
-
+Plan
+Wk1  - Begin framework 
+Wk2  -
+Wk3  - 
+Wk4  - Begin implant
+Wk5
+Wk6  - Begin ML system
+Wk7
+Wk8
+Wk9
+Wk10 - Touch ups
+Wk11 - Testing
+Wk12 - Testing
+Wk13 - Touch ups
+Wk14 - Finish
 
 
 
