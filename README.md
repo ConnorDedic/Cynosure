@@ -1,9 +1,28 @@
 # Cynosure C2
 This will be a ML empowered modular C2 
 
+## Structure
+- Command and Control
+    - CLI UI
+    - API for interfacing with modules and implants
+- Implant
+    - Windows only (for now)
+    - Basic API if custom module isn't loaded
+- ML Model
+    - Reinforcement Learning
 
-
-
+## Modules
+- Comm
+    - DNS
+    - HTTPS
+    - Github Image Steganography
+- Evasion
+    - Syscall
+        - Direct
+        - Indirect 
+        - Hell's Gate
+    - Obfuscation
+        - Encrypted Memory Loader
 
 
 
