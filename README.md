@@ -1,12 +1,4 @@
-```
-  .,-:::::  .-:.     ::-.:::.    :::.    ...      .::::::.  ...    ::::::::::..   .,::::::  
-,;;;'````'   ';;.   ;;;;'`;;;;,  `;;; .;;;;;;;.  ;;;`    `  ;;     ;;;;;;;``;;;;  ;;;;''''  
-[[[            '[[,[[['    [[[[[. '[[,[[     \[[,'[==/[[[[,[['     [[[ [[[,/[[['   [[cccc   
-$$$              c$$"      $$$ "Y$c$$$$$,     $$$  '''    $$$      $$$ $$$$$$c     $$""""   
-`88bo,__,o,    ,8P"`       888    Y88"888,_ _,88P 88b    dP88    .d888 888b "88bo, 888oo,__ 
-  "YUMMMMMP"  mM"          MMM     YM  "YMMMMMP"   "YMmMY"  "YmmMMMM"" MMMM   "W"  """"YUMMM
-```
-
+# Cynosure C2
 
 ## Structure
 - Command and Control
@@ -45,11 +37,13 @@ $$$              c$$"      $$$ "Y$c$$$$$,     $$$  '''    $$$      $$$ $$$$$$c  
 6. Be able to bypass defender
 
 
-<img width="1917" height="1003" alt="image" src="https://github.com/user-attachments/assets/c68476d0-f4a1-4bcf-a141-9282b45ecadd" />
+<img width="1917" height="1003" alt="Main C2 TUI" src="https://github.com/user-attachments/assets/c68476d0-f4a1-4bcf-a141-9282b45ecadd" />
 - Main C2 TUI
 
-<img width="1917" height="1003" alt="image" src="https://github.com/user-attachments/assets/b97f0137-bf48-4fe6-b328-94c4864238f0" />
+
+<img width="1917" height="1003" alt="Shell Drilldown" src="https://github.com/user-attachments/assets/b97f0137-bf48-4fe6-b328-94c4864238f0" />
 - Shell Drilldown
 
-<img width="1917" height="1003" alt="image" src="https://github.com/user-attachments/assets/2d94fee7-2c30-491a-9382-bf489d5a5da5" />
+
+<img width="1917" height="1003" alt="Command Execution Menu" src="https://github.com/user-attachments/assets/2d94fee7-2c30-491a-9382-bf489d5a5da5" />
 - Command Execution Menu
