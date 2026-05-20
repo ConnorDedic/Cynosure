@@ -1,0 +1,12 @@
+[package]
+name = "cynosure_tui"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ratatui = "0.26"
+crossterm = "0.27"
+walkdir = "2.5"
+
+# Feature flag for dynamic module loading (default: enabled)
+# Build with --no-default-features --features static-only to disable this

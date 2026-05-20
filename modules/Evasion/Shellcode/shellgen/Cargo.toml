@@ -1,0 +1,11 @@
+[package]
+name = "cynosure_shellgen"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "shellgen"
+path = "src/main.rs"
+
+[dependencies]
+# No external dependencies needed for this module
