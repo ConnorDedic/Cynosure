@@ -1,5 +1,12 @@
-# Cynosure C2
-This will be a ML empowered modular C2 
+```
+  .,-:::::  .-:.     ::-.:::.    :::.    ...      .::::::.  ...    ::::::::::..   .,::::::  
+,;;;'````'   ';;.   ;;;;'`;;;;,  `;;; .;;;;;;;.  ;;;`    `  ;;     ;;;;;;;``;;;;  ;;;;''''  
+[[[            '[[,[[['    [[[[[. '[[,[[     \[[,'[==/[[[[,[['     [[[ [[[,/[[['   [[cccc   
+$$$              c$$"      $$$ "Y$c$$$$$,     $$$  '''    $$$      $$$ $$$$$$c     $$""""   
+`88bo,__,o,    ,8P"`       888    Y88"888,_ _,88P 88b    dP88    .d888 888b "88bo, 888oo,__ 
+  "YUMMMMMP"  mM"          MMM     YM  "YMMMMMP"   "YMmMY"  "YmmMMMM"" MMMM   "W"  """"YUMMM
+```
+
 
 ## Structure
 - Command and Control
@@ -10,7 +17,6 @@ This will be a ML empowered modular C2
     - Basic API if custom module isn't loaded
 - ML Model
     - Reinforcement Learning
-
 ## Modules
 - Comm
     - DNS
@@ -19,40 +25,31 @@ This will be a ML empowered modular C2
 - Evasion
     - Syscall
         - Direct
-        - Indirect 
+        - Indirect
         - Hell's Gate
     - Obfuscation
         - Encrypted Memory Loader
 
+# Functional Requirements
 
-Plan
-Wk1  - Begin framework 
-Wk2  -
-Wk3  - 
-Wk4  - Begin implant
-Wk5
-Wk6  - Begin ML system
-Wk7
-Wk8
-Wk9
-Wk10 - Touch ups
-Wk11 - Testing
-Wk12 - Testing
-Wk13 - Touch ups
-Wk14 - Finish
+1. Provide a C2 system with an interface, communication and upgradeability
+
+2. Utilize a basic RL model that allows the C2 to be trained on which modules to use in a given situation 
+
+3. Utilize a modular polymorphic implant allowing a user to control actions while allowing the C2 to control how the actions are performed
+
+4. Demonstrate the C2 can make independent choices
+
+5. Include 3 comm modules, and 3 shellcode execution modules
+
+6. Be able to bypass defender
 
 
+<img width="1917" height="1003" alt="image" src="https://github.com/user-attachments/assets/c68476d0-f4a1-4bcf-a141-9282b45ecadd" />
+- Main C2 TUI
 
+<img width="1917" height="1003" alt="image" src="https://github.com/user-attachments/assets/b97f0137-bf48-4fe6-b328-94c4864238f0" />
+- Shell Drilldown
 
-
-
-
-
-```
-  .,-:::::  .-:.     ::-.:::.    :::.    ...      .::::::.  ...    ::::::::::..   .,::::::  
-,;;;'````'   ';;.   ;;;;'`;;;;,  `;;; .;;;;;;;.  ;;;`    `  ;;     ;;;;;;;``;;;;  ;;;;''''  
-[[[            '[[,[[['    [[[[[. '[[,[[     \[[,'[==/[[[[,[['     [[[ [[[,/[[['   [[cccc   
-$$$              c$$"      $$$ "Y$c$$$$$,     $$$  '''    $$$      $$$ $$$$$$c     $$""""   
-`88bo,__,o,    ,8P"`       888    Y88"888,_ _,88P 88b    dP88    .d888 888b "88bo, 888oo,__ 
-  "YUMMMMMP"  mM"          MMM     YM  "YMMMMMP"   "YMmMY"  "YmmMMMM"" MMMM   "W"  """"YUMMM
-```
+<img width="1917" height="1003" alt="image" src="https://github.com/user-attachments/assets/2d94fee7-2c30-491a-9382-bf489d5a5da5" />
+- Command Execution Menu
