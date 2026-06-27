@@ -1,0 +1,4 @@
+LIBRARY cynosure_vpn_comm
+EXPORTS
+    edr_plugin_entry
+    vpn_set_dispatcher

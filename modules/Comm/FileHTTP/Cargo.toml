@@ -1,0 +1,14 @@
+[package]
+name = "cynosure_file_http"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+path = "file_http_comm_stub.rs"
+
+[dependencies]
+
+[profile.release]
+opt-level = 3
+lto = true

@@ -1,0 +1,91 @@
+cargo:rerun-if-env-changed=CC_FORCE_DISABLE
+CC_FORCE_DISABLE = None
+cargo:rerun-if-env-changed=CC_x86_64-pc-windows-gnu
+CC_x86_64-pc-windows-gnu = None
+cargo:rerun-if-env-changed=CC_x86_64_pc_windows_gnu
+CC_x86_64_pc_windows_gnu = None
+cargo:rerun-if-env-changed=TARGET_CC
+TARGET_CC = None
+cargo:rerun-if-env-changed=CC
+CC = None
+cargo:rerun-if-env-changed=CROSS_COMPILE
+CROSS_COMPILE = None
+cargo:rerun-if-env-changed=CC_ENABLE_DEBUG_OUTPUT
+cargo:rerun-if-env-changed=CRATE_CC_NO_DEFAULTS
+CRATE_CC_NO_DEFAULTS = None
+cargo:rerun-if-env-changed=CFLAGS
+CFLAGS = None
+cargo:rerun-if-env-changed=TARGET_CFLAGS
+TARGET_CFLAGS = None
+cargo:rerun-if-env-changed=CFLAGS_x86_64_pc_windows_gnu
+CFLAGS_x86_64_pc_windows_gnu = None
+cargo:rerun-if-env-changed=CFLAGS_x86_64-pc-windows-gnu
+CFLAGS_x86_64-pc-windows-gnu = None
+cargo:warning=vpn_comm.c:27: warning: ignoring '#pragma comment ' [-Wunknown-pragmas]
+cargo:warning=   27 | #  pragma comment(lib, "ws2_32.lib")
+cargo:warning=vpn_comm.c: In function 'vpn_connect_internal':
+cargo:warning=vpn_comm.c:266:14: warning: comparison of integer expressions of different signedness: 'int' and 'long long unsigned int' [-Wsign-compare]
+cargo:warning=  266 |     if (sock == INVALID_SOCKET) {
+cargo:warning=      |              ^~
+cargo:warning=vpn_comm.c: In function 'vpn_disconnect':
+cargo:warning=vpn_comm.c:340:22: warning: comparison of integer expressions of different signedness: 'int' and 'long long unsigned int' [-Wsign-compare]
+cargo:warning=  340 |     if (g_vpn.socket != INVALID_SOCKET) {
+cargo:warning=      |                      ^~
+cargo:warning=vpn_comm.c:342:24: warning: overflow in conversion from 'long long unsigned int' to 'int' changes value from '18446744073709551615' to '-1' [-Woverflow]
+cargo:warning=  342 |         g_vpn.socket = INVALID_SOCKET;
+cargo:warning=      |                        ^~~~~~~~~~~~~~
+cargo:warning=vpn_comm.c: In function 'vpn_init':
+cargo:warning=vpn_comm.c:454:20: warning: overflow in conversion from 'long long unsigned int' to 'int' changes value from '18446744073709551615' to '-1' [-Woverflow]
+cargo:warning=  454 |     g_vpn.socket = INVALID_SOCKET;
+cargo:warning=      |                    ^~~~~~~~~~~~~~
+cargo:warning=vpn_comm.c: In function 'vpn_shutdown':
+cargo:warning=vpn_comm.c:474:22: warning: comparison of integer expressions of different signedness: 'int' and 'long long unsigned int' [-Wsign-compare]
+cargo:warning=  474 |     if (g_vpn.socket != INVALID_SOCKET) {
+cargo:warning=      |                      ^~
+cargo:warning=vpn_comm.c:476:24: warning: overflow in conversion from 'long long unsigned int' to 'int' changes value from '18446744073709551615' to '-1' [-Woverflow]
+cargo:warning=  476 |         g_vpn.socket = INVALID_SOCKET;
+cargo:warning=      |                        ^~~~~~~~~~~~~~
+cargo:warning=vpn_comm.c: At top level:
+cargo:warning=vpn_comm.c:186:21: warning: 'vpn_recv_frame' defined but not used [-Wunused-function]
+cargo:warning=  186 | static edr_status_t vpn_recv_frame(int sock, uint8_t **out_payload,
+cargo:warning=      |                     ^~~~~~~~~~~~~~
+cargo:rerun-if-env-changed=AR_x86_64-pc-windows-gnu
+AR_x86_64-pc-windows-gnu = None
+cargo:rerun-if-env-changed=AR_x86_64_pc_windows_gnu
+AR_x86_64_pc_windows_gnu = None
+cargo:rerun-if-env-changed=TARGET_AR
+TARGET_AR = None
+cargo:rerun-if-env-changed=AR
+AR = None
+cargo:rerun-if-env-changed=CROSS_COMPILE
+CROSS_COMPILE = None
+cargo:rerun-if-env-changed=ARFLAGS
+ARFLAGS = None
+cargo:rerun-if-env-changed=TARGET_ARFLAGS
+TARGET_ARFLAGS = None
+cargo:rerun-if-env-changed=ARFLAGS_x86_64_pc_windows_gnu
+ARFLAGS_x86_64_pc_windows_gnu = None
+cargo:rerun-if-env-changed=ARFLAGS_x86_64-pc-windows-gnu
+ARFLAGS_x86_64-pc-windows-gnu = None
+cargo:rerun-if-env-changed=AR_x86_64-pc-windows-gnu
+AR_x86_64-pc-windows-gnu = None
+cargo:rerun-if-env-changed=AR_x86_64_pc_windows_gnu
+AR_x86_64_pc_windows_gnu = None
+cargo:rerun-if-env-changed=TARGET_AR
+TARGET_AR = None
+cargo:rerun-if-env-changed=AR
+AR = None
+cargo:rerun-if-env-changed=CROSS_COMPILE
+CROSS_COMPILE = None
+cargo:rerun-if-env-changed=ARFLAGS
+ARFLAGS = None
+cargo:rerun-if-env-changed=TARGET_ARFLAGS
+TARGET_ARFLAGS = None
+cargo:rerun-if-env-changed=ARFLAGS_x86_64_pc_windows_gnu
+ARFLAGS_x86_64_pc_windows_gnu = None
+cargo:rerun-if-env-changed=ARFLAGS_x86_64-pc-windows-gnu
+ARFLAGS_x86_64-pc-windows-gnu = None
+cargo:rustc-link-lib=static=vpn_comm
+cargo:rustc-link-search=native=/home/branis/Cynosure/modules/Comm/VPN/target/x86_64-pc-windows-gnu/release/build/cynosure_vpn_comm-c09f846542d34bf4/out
+cargo:rustc-link-arg=-Wl,--export-all-symbols
+cargo:rustc-link-arg=-Wl,--subsystem,windows

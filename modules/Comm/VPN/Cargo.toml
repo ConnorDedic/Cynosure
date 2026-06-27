@@ -1,0 +1,15 @@
+[package]
+name = "cynosure_vpn_comm"
+version = "1.0.0"
+edition = "2021"
+
+[lib]
+name = "cynosure_vpn_comm"
+path = "main.rs"
+crate-type = ["cdylib"]  # Compile to a shared library (.so/.dll)
+
+[dependencies]
+# No Rust dependencies needed; we link against vpn_comm.c via build.rs
+
+[build-dependencies]
+cc = "1.0"
