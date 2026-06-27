@@ -1808,10 +1808,33 @@ static edr_status_t cmd_screenshot(edr_dispatcher_t *d,
         return EDR_ERR_GENERIC;
     }
 
-    /* GetDIBits returns number of scanlines successfully read, NOT success/failure
-     * Must check if we got ALL scanlines (height scanlines) */
+    /* Windows GetDIBits pattern: must call TWICE
+     * 1. First call with NULL buffer to query/initialize header info
+     * 2. Second call with actual buffer to get the pixel bits
+     * Calling only once leaves buffer as zeros! */
+
     dispatcher_log(d, EDR_LOG_DEBUG, "dispatcher",
-                   "[SCREENSHOT] Calling GetDIBits: width=%d height=%d buffer_size=%zu",
+                   "[SCREENSHOT] Query GetDIBits header: width=%d height=%d",
+                   width, height);
+
+    /* First call: NULL buffer to query header and prepare for data transfer */
+    int query_result = GetDIBits(mem_dc, bitmap, 0, height, NULL, (BITMAPINFO *)&bih, DIB_RGB_COLORS);
+    dispatcher_log(d, EDR_LOG_DEBUG, "dispatcher",
+                   "[SCREENSHOT] Query returned: %d", query_result);
+
+    if (query_result == 0) {
+        dispatcher_log(d, EDR_LOG_ERROR, "dispatcher",
+                       "[SCREENSHOT] GetDIBits query failed");
+        free(pixels);
+        DeleteObject(bitmap);
+        DeleteDC(mem_dc);
+        ReleaseDC(NULL, screen_dc);
+        return EDR_ERR_GENERIC;
+    }
+
+    /* Second call: with actual buffer to get the pixel data */
+    dispatcher_log(d, EDR_LOG_DEBUG, "dispatcher",
+                   "[SCREENSHOT] Reading pixel data: width=%d height=%d buffer_size=%zu",
                    width, height, pixel_data_size);
 
     int scanlines_read = GetDIBits(mem_dc, bitmap, 0, height, pixels, (BITMAPINFO *)&bih, DIB_RGB_COLORS);
@@ -1831,10 +1854,15 @@ static edr_status_t cmd_screenshot(edr_dispatcher_t *d,
         return EDR_ERR_GENERIC;
     }
 
-    /* Check if buffer actually contains data by examining first and last bytes */
-    dispatcher_log(d, EDR_LOG_DEBUG, "dispatcher",
-                   "[SCREENSHOT] Buffer check: first_byte=0x%02x last_byte=0x%02x",
-                   pixels[0], pixels[pixel_data_size - 1]);
+    /* Verify buffer contains actual data (not zeros) */
+    if (pixels[0] == 0x00 && pixels[pixel_data_size - 1] == 0x00) {
+        dispatcher_log(d, EDR_LOG_WARN, "dispatcher",
+                       "[SCREENSHOT] WARNING: Buffer still all zeros after GetDIBits (possible DC issue)");
+    } else {
+        dispatcher_log(d, EDR_LOG_DEBUG, "dispatcher",
+                       "[SCREENSHOT] Buffer contains data: first_byte=0x%02x last_byte=0x%02x",
+                       pixels[0], pixels[pixel_data_size - 1]);
+    }
 
     /* Create BMP header (54 bytes total: 14-byte file header + 40-byte DIB header) */
     unsigned char bmp_header[54];
