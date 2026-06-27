@@ -27,6 +27,8 @@
 #ifdef _WIN32
 #  define WIN32_LEAN_AND_MEAN
 #  include <windows.h>
+#  include <tlhelp32.h>
+#  include <psapi.h>
 /* dlopen / dlsym / dlclose / dlerror shims */
 #  define RTLD_NOW   0
 #  define RTLD_LOCAL 0
@@ -1412,6 +1414,16 @@ static edr_status_t cmd_shell(edr_dispatcher_t *d,
         return EDR_ERR_GENERIC;
     }
 
+    /* Mark read end as non-inheritable so child doesn't hold a reference to it
+     * This allows the parent to detect when child closes the write end */
+    if (!SetHandleInformation(hReadPipe, HANDLE_FLAG_INHERIT, 0)) {
+        dispatcher_log(d, EDR_LOG_ERROR, "dispatcher",
+                       "SetHandleInformation failed: %lu", GetLastError());
+        CloseHandle(hReadPipe);
+        CloseHandle(hWritePipe);
+        return EDR_ERR_GENERIC;
+    }
+
     STARTUPINFOA si = {0};
     PROCESS_INFORMATION pi = {0};
     si.cb = sizeof(si);
@@ -1468,6 +1480,8 @@ static edr_status_t cmd_shell(edr_dispatcher_t *d,
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
 
+    dispatcher_log(d, EDR_LOG_DEBUG, "dispatcher",
+                   "Shell output captured: %zu bytes from '%s'", output_len, cmd);
     dispatcher_log(d, EDR_LOG_INFO, "dispatcher",
                    "Shell command executed, captured %zu bytes", output_len);
 
@@ -1796,6 +1810,145 @@ static edr_status_t cmd_screenshot(edr_dispatcher_t *d,
 }
 #endif
 
+/* Process listing (PS) command for Windows */
+#ifdef _WIN32
+static edr_status_t cmd_ps(edr_dispatcher_t *d,
+                           const edr_message_t *msg,
+                           edr_completion_cb_t cb, void *ctx)
+{
+    (void)msg; (void)cb; (void)ctx;
+
+    char output_buffer[65536] = {0};
+    size_t output_len = 0;
+
+    dispatcher_log(d, EDR_LOG_DEBUG, "dispatcher", "[cmd_ps] Enumerating processes");
+
+    /* Create snapshot of all processes */
+    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnapshot == INVALID_HANDLE_VALUE) {
+        dispatcher_log(d, EDR_LOG_ERROR, "dispatcher",
+                       "CreateToolhelp32Snapshot failed: %lu", GetLastError());
+        return EDR_ERR_GENERIC;
+    }
+
+    /* Add header to output */
+    output_len += snprintf(output_buffer + output_len,
+                          sizeof(output_buffer) - output_len,
+                          "%-6s %-32s %-8s %s\n",
+                          "PID", "PROCESS_NAME", "MEM_KB", "COMMAND_LINE");
+
+    /* Iterate through processes */
+    PROCESSENTRY32 pe;
+    pe.dwSize = sizeof(pe);
+
+    if (!Process32First(hSnapshot, &pe)) {
+        dispatcher_log(d, EDR_LOG_ERROR, "dispatcher",
+                       "Process32First failed: %lu", GetLastError());
+        CloseHandle(hSnapshot);
+        return EDR_ERR_GENERIC;
+    }
+
+    do {
+        /* Open process to get memory info */
+        DWORD mem_kb = 0;
+        HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ,
+                                      FALSE, pe.th32ProcessID);
+        if (hProcess) {
+            /* Try to get memory info using Windows API */
+            PROCESS_MEMORY_COUNTERS pmc;
+            if (GetProcessMemoryInfo(hProcess, &pmc, sizeof(pmc))) {
+                mem_kb = (DWORD)(pmc.WorkingSetSize / 1024);
+            }
+            CloseHandle(hProcess);
+        }
+
+        /* Safely truncate process name and add to output */
+        char proc_name[MAX_PATH];
+        strncpy(proc_name, pe.szExeFile, sizeof(proc_name) - 1);
+        proc_name[sizeof(proc_name) - 1] = '\0';
+
+        /* Note: Command line retrieval requires WMI or scanning /proc-like structures
+         * For now we'll use empty string. Full implementation would use WMI.
+         */
+        const char *cmd_line = "";
+
+        /* Add process line to output buffer */
+        size_t line_len = snprintf(output_buffer + output_len,
+                                  sizeof(output_buffer) - output_len,
+                                  "%-6lu %-32s %-8lu %s\n",
+                                  (unsigned long)pe.th32ProcessID,
+                                  proc_name,
+                                  (unsigned long)mem_kb,
+                                  cmd_line);
+
+        if (output_len + line_len < sizeof(output_buffer)) {
+            output_len += line_len;
+        } else {
+            /* Buffer full, stop adding processes */
+            break;
+        }
+
+    } while (Process32Next(hSnapshot, &pe));
+
+    CloseHandle(hSnapshot);
+
+    dispatcher_log(d, EDR_LOG_INFO, "dispatcher",
+                   "Process enumeration complete: %zu bytes", output_len);
+
+    /* Queue output back to listener using base64 encoding (same as shell command) */
+    if (output_len > 0) {
+        /* Base64 encode output */
+        static const char b64_table[] =
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        char b64_output[98304];  /* Must be at least 4/3 * output_len + 1 */
+        size_t b64_idx = 0;
+
+        for (size_t i = 0; i < output_len; i += 3) {
+            uint32_t b = 0;
+            size_t len = (output_len - i < 3) ? (output_len - i) : 3;
+            for (size_t k = 0; k < len; k++) b = (b << 8) | output_buffer[i + k];
+            b <<= (3 - len) * 8;
+
+            if (b64_idx < sizeof(b64_output) - 4) {
+                b64_output[b64_idx++] = b64_table[(b >> 18) & 0x3F];
+                b64_output[b64_idx++] = b64_table[(b >> 12) & 0x3F];
+                b64_output[b64_idx++] = (len > 1) ? b64_table[(b >> 6) & 0x3F] : '=';
+                b64_output[b64_idx++] = (len > 2) ? b64_table[b & 0x3F] : '=';
+            }
+        }
+        b64_output[b64_idx] = '\0';
+
+        /* Create response payload */
+        char payload[98304];
+        snprintf(payload, sizeof(payload),
+                 "{\"file\":\"ps_output.txt\",\"command\":\"ps\",\"output\":\"%s\",\"bytes\":%zu}",
+                 b64_output, output_len);
+
+        /* Queue message via callback if available */
+        if (d->enqueue_msg_cb) {
+            d->enqueue_msg_cb(payload);
+        } else {
+            /* Fallback: queue locally */
+            pthread_mutex_lock(&d->file_queue_mu);
+            if (d->file_chunk_count < 256) {
+                d->file_chunks[d->file_chunk_count] = (char *)malloc(strlen(payload) + 1);
+                if (d->file_chunks[d->file_chunk_count]) {
+                    strcpy(d->file_chunks[d->file_chunk_count], payload);
+                    d->file_chunk_count++;
+                }
+            }
+            pthread_mutex_unlock(&d->file_queue_mu);
+        }
+
+        dispatcher_log(d, EDR_LOG_INFO, "dispatcher",
+                       "Process list queued: %zu bytes encoded as base64",
+                       output_len);
+    }
+
+    return EDR_OK;
+}
+#endif
+
 /* -------------------------------------------------------------------------
  * Register all command_id → handler mappings
  * -------------------------------------------------------------------------*/
@@ -1815,6 +1968,7 @@ static void register_all_commands(edr_dispatcher_t *d)
     cmd_table_insert(d, "shell",                  cmd_shell);
 #ifdef _WIN32
     cmd_table_insert(d, "screenshot",             cmd_screenshot);
+    cmd_table_insert(d, "ps",                     cmd_ps);
 #endif
     cmd_table_insert(d, "remediate.kill",         cmd_remediate_kill);
     cmd_table_insert(d, "remediate.quarantine",   cmd_remediate_quarantine);
