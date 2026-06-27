@@ -1395,10 +1395,10 @@ static edr_status_t cmd_shell(edr_dispatcher_t *d,
     size_t output_len = 0;
 
     dispatcher_log(d, EDR_LOG_DEBUG, "dispatcher",
-                   "[cmd_shell] Executing: %s", cmd);
+                   "[SHELL] Command: %s", cmd);
 
 #ifdef _WIN32
-    /* Windows: Use CreateProcessA with pipes for stdout capture
+    /* Windows: Try pipes first, fallback to temp file if pipes fail
      * Build command line with proper quote escaping: " becomes ""
      */
     HANDLE hReadPipe, hWritePipe;
@@ -1407,83 +1407,204 @@ static edr_status_t cmd_shell(edr_dispatcher_t *d,
     sa.bInheritHandle = TRUE;
     sa.lpSecurityDescriptor = NULL;
 
+    dispatcher_log(d, EDR_LOG_DEBUG, "dispatcher",
+                   "[SHELL] Attempting pipe creation");
+
     /* Create pipe for stdout capture */
     if (!CreatePipe(&hReadPipe, &hWritePipe, &sa, 0)) {
-        dispatcher_log(d, EDR_LOG_ERROR, "dispatcher",
-                       "Failed to create pipe: %lu", GetLastError());
-        return EDR_ERR_GENERIC;
-    }
+        dispatcher_log(d, EDR_LOG_WARN, "dispatcher",
+                       "[SHELL] Pipe creation failed: %lu, falling back to temp file", GetLastError());
 
-    /* Mark read end as non-inheritable so child doesn't hold a reference to it
-     * This allows the parent to detect when child closes the write end */
-    if (!SetHandleInformation(hReadPipe, HANDLE_FLAG_INHERIT, 0)) {
-        dispatcher_log(d, EDR_LOG_ERROR, "dispatcher",
-                       "SetHandleInformation failed: %lu", GetLastError());
-        CloseHandle(hReadPipe);
-        CloseHandle(hWritePipe);
-        return EDR_ERR_GENERIC;
-    }
-
-    STARTUPINFOA si = {0};
-    PROCESS_INFORMATION pi = {0};
-    si.cb = sizeof(si);
-    si.dwFlags = STARTF_USESTDHANDLES;
-    si.hStdOutput = hWritePipe;
-    si.hStdError = hWritePipe;
-    si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
-
-    /* Escape double quotes in cmd: " -> "" (cmd.exe escaping)
-     * Build command line with escaped user input to prevent breaking quotes
-     */
-    char cmd_line[2048] = {0};
-    char escaped_cmd[1024] = {0};
-    size_t esc_idx = 0;
-
-    for (size_t i = 0; cmd[i] && esc_idx < sizeof(escaped_cmd) - 2; i++) {
-        if (cmd[i] == '"') {
-            /* Escape quote by doubling it: " -> "" */
-            escaped_cmd[esc_idx++] = '"';
-            escaped_cmd[esc_idx++] = '"';
-        } else {
-            escaped_cmd[esc_idx++] = cmd[i];
+        /* Fallback: Use temp file instead of pipe */
+        char temp_file[MAX_PATH];
+        char temp_dir[MAX_PATH];
+        if (!GetTempPathA(sizeof(temp_dir), temp_dir)) {
+            strcpy_s(temp_dir, sizeof(temp_dir), ".");
         }
-    }
-    escaped_cmd[esc_idx] = '\0';
-
-    snprintf(cmd_line, sizeof(cmd_line) - 1, "cmd.exe /c \"%s\"", escaped_cmd);
-
-    if (!CreateProcessA(NULL, cmd_line, NULL, NULL, TRUE, CREATE_NO_WINDOW,
-                        NULL, NULL, &si, &pi)) {
-        dispatcher_log(d, EDR_LOG_ERROR, "dispatcher",
-                       "CreateProcessA failed: %lu", GetLastError());
-        CloseHandle(hReadPipe);
-        CloseHandle(hWritePipe);
-        return EDR_ERR_GENERIC;
-    }
-
-    /* Close write end in parent process */
-    CloseHandle(hWritePipe);
-
-    /* Read output from pipe */
-    DWORD dwRead;
-    unsigned char read_buf[4096];
-    while (ReadFile(hReadPipe, read_buf, sizeof(read_buf), &dwRead, NULL) && dwRead > 0) {
-        if (output_len + dwRead <= sizeof(output_buffer)) {
-            memcpy(output_buffer + output_len, read_buf, dwRead);
-            output_len += dwRead;
+        if (!GetTempFileNameA(temp_dir, "cmd", 0, temp_file)) {
+            dispatcher_log(d, EDR_LOG_ERROR, "dispatcher",
+                           "[SHELL] GetTempFileName failed: %lu", GetLastError());
+            return EDR_ERR_GENERIC;
         }
+
+        dispatcher_log(d, EDR_LOG_DEBUG, "dispatcher",
+                       "[SHELL] Using temp file: %s", temp_file);
+
+        HANDLE hOut = CreateFileA(temp_file, GENERIC_WRITE, 0, &sa, CREATE_ALWAYS,
+                                  FILE_ATTRIBUTE_TEMPORARY, NULL);
+        if (hOut == INVALID_HANDLE_VALUE) {
+            dispatcher_log(d, EDR_LOG_ERROR, "dispatcher",
+                           "[SHELL] CreateFile for temp output failed: %lu", GetLastError());
+            return EDR_ERR_GENERIC;
+        }
+
+        STARTUPINFOA si = {0};
+        PROCESS_INFORMATION pi = {0};
+        si.cb = sizeof(si);
+        si.dwFlags = STARTF_USESTDHANDLES;
+        si.hStdOutput = hOut;
+        si.hStdError = hOut;
+        si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+
+        char cmd_line[2048] = {0};
+        char escaped_cmd[1024] = {0};
+        size_t esc_idx = 0;
+
+        for (size_t i = 0; cmd[i] && esc_idx < sizeof(escaped_cmd) - 2; i++) {
+            if (cmd[i] == '"') {
+                escaped_cmd[esc_idx++] = '"';
+                escaped_cmd[esc_idx++] = '"';
+            } else {
+                escaped_cmd[esc_idx++] = cmd[i];
+            }
+        }
+        escaped_cmd[esc_idx] = '\0';
+
+        snprintf(cmd_line, sizeof(cmd_line) - 1, "cmd.exe /c \"%s\"", escaped_cmd);
+
+        dispatcher_log(d, EDR_LOG_DEBUG, "dispatcher",
+                       "[SHELL] CreateProcessA: %s", cmd_line);
+
+        if (!CreateProcessA(NULL, cmd_line, NULL, NULL, TRUE, CREATE_NO_WINDOW,
+                            NULL, NULL, &si, &pi)) {
+            dispatcher_log(d, EDR_LOG_ERROR, "dispatcher",
+                           "[SHELL] CreateProcessA failed: %lu", GetLastError());
+            CloseHandle(hOut);
+            DeleteFileA(temp_file);
+            return EDR_ERR_GENERIC;
+        }
+
+        dispatcher_log(d, EDR_LOG_DEBUG, "dispatcher",
+                       "[SHELL] Process created, waiting for completion");
+
+        CloseHandle(hOut);
+        WaitForSingleObject(pi.hProcess, INFINITE);
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+
+        dispatcher_log(d, EDR_LOG_DEBUG, "dispatcher",
+                       "[SHELL] Process completed, reading temp file");
+
+        /* Read from temp file */
+        HANDLE hRead = CreateFileA(temp_file, GENERIC_READ, FILE_SHARE_READ, NULL,
+                                   OPEN_EXISTING, 0, NULL);
+        if (hRead == INVALID_HANDLE_VALUE) {
+            dispatcher_log(d, EDR_LOG_ERROR, "dispatcher",
+                           "[SHELL] CreateFile for temp input failed: %lu", GetLastError());
+            DeleteFileA(temp_file);
+            return EDR_ERR_GENERIC;
+        }
+
+        DWORD dwRead;
+        unsigned char read_buf[4096];
+        while (ReadFile(hRead, read_buf, sizeof(read_buf), &dwRead, NULL) && dwRead > 0) {
+            dispatcher_log(d, EDR_LOG_DEBUG, "dispatcher",
+                           "[SHELL] ReadFile returned %lu bytes", dwRead);
+            if (output_len + dwRead <= sizeof(output_buffer)) {
+                memcpy(output_buffer + output_len, read_buf, dwRead);
+                output_len += dwRead;
+            }
+        }
+
+        dispatcher_log(d, EDR_LOG_DEBUG, "dispatcher",
+                       "[SHELL] ReadFile complete, total output_len=%zu", output_len);
+
+        CloseHandle(hRead);
+        DeleteFileA(temp_file);
+
+        dispatcher_log(d, EDR_LOG_INFO, "dispatcher",
+                       "[SHELL] Shell command executed (temp file), captured %zu bytes", output_len);
+    } else {
+        /* Pipe method succeeded */
+        dispatcher_log(d, EDR_LOG_DEBUG, "dispatcher",
+                       "[SHELL] Pipe created: read=%p write=%p", (void *)hReadPipe, (void *)hWritePipe);
+
+        /* Mark read end as non-inheritable so child doesn't hold a reference to it
+         * This allows the parent to detect when child closes the write end */
+        if (!SetHandleInformation(hReadPipe, HANDLE_FLAG_INHERIT, 0)) {
+            dispatcher_log(d, EDR_LOG_ERROR, "dispatcher",
+                           "[SHELL] SetHandleInformation failed: %lu", GetLastError());
+            CloseHandle(hReadPipe);
+            CloseHandle(hWritePipe);
+            return EDR_ERR_GENERIC;
+        }
+
+        STARTUPINFOA si = {0};
+        PROCESS_INFORMATION pi = {0};
+        si.cb = sizeof(si);
+        si.dwFlags = STARTF_USESTDHANDLES;
+        si.hStdOutput = hWritePipe;
+        si.hStdError = hWritePipe;
+        si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+
+        /* Escape double quotes in cmd: " -> "" (cmd.exe escaping) */
+        char cmd_line[2048] = {0};
+        char escaped_cmd[1024] = {0};
+        size_t esc_idx = 0;
+
+        for (size_t i = 0; cmd[i] && esc_idx < sizeof(escaped_cmd) - 2; i++) {
+            if (cmd[i] == '"') {
+                escaped_cmd[esc_idx++] = '"';
+                escaped_cmd[esc_idx++] = '"';
+            } else {
+                escaped_cmd[esc_idx++] = cmd[i];
+            }
+        }
+        escaped_cmd[esc_idx] = '\0';
+
+        snprintf(cmd_line, sizeof(cmd_line) - 1, "cmd.exe /c \"%s\"", escaped_cmd);
+
+        dispatcher_log(d, EDR_LOG_DEBUG, "dispatcher",
+                       "[SHELL] CreateProcessA: %s", cmd_line);
+
+        if (!CreateProcessA(NULL, cmd_line, NULL, NULL, TRUE, CREATE_NO_WINDOW,
+                            NULL, NULL, &si, &pi)) {
+            dispatcher_log(d, EDR_LOG_ERROR, "dispatcher",
+                           "[SHELL] CreateProcessA failed: %lu", GetLastError());
+            CloseHandle(hReadPipe);
+            CloseHandle(hWritePipe);
+            return EDR_ERR_GENERIC;
+        }
+
+        dispatcher_log(d, EDR_LOG_DEBUG, "dispatcher",
+                       "[SHELL] Process created, closing write pipe in parent");
+
+        /* Close write end in parent process */
+        CloseHandle(hWritePipe);
+
+        dispatcher_log(d, EDR_LOG_DEBUG, "dispatcher",
+                       "[SHELL] Entering ReadFile loop");
+
+        /* Read output from pipe */
+        DWORD dwRead;
+        unsigned char read_buf[4096];
+        int read_attempt = 0;
+        while (ReadFile(hReadPipe, read_buf, sizeof(read_buf), &dwRead, NULL) && dwRead > 0) {
+            dispatcher_log(d, EDR_LOG_DEBUG, "dispatcher",
+                           "[SHELL] ReadFile attempt %d: dwRead=%lu", read_attempt++, dwRead);
+            if (output_len + dwRead <= sizeof(output_buffer)) {
+                memcpy(output_buffer + output_len, read_buf, dwRead);
+                output_len += dwRead;
+            }
+        }
+
+        dispatcher_log(d, EDR_LOG_DEBUG, "dispatcher",
+                       "[SHELL] ReadFile loop complete, output_len=%zu", output_len);
+
+        CloseHandle(hReadPipe);
+
+        /* Wait for process completion */
+        dispatcher_log(d, EDR_LOG_DEBUG, "dispatcher",
+                       "[SHELL] Waiting for process completion");
+        WaitForSingleObject(pi.hProcess, INFINITE);
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+
+        dispatcher_log(d, EDR_LOG_INFO, "dispatcher",
+                       "[SHELL] Shell command executed (pipes), captured %zu bytes", output_len);
     }
-    CloseHandle(hReadPipe);
-
-    /* Wait for process completion */
-    WaitForSingleObject(pi.hProcess, INFINITE);
-    CloseHandle(pi.hProcess);
-    CloseHandle(pi.hThread);
-
     dispatcher_log(d, EDR_LOG_DEBUG, "dispatcher",
-                   "Shell output captured: %zu bytes from '%s'", output_len, cmd);
-    dispatcher_log(d, EDR_LOG_INFO, "dispatcher",
-                   "Shell command executed, captured %zu bytes", output_len);
+                   "[SHELL] Final output_len=%zu", output_len);
 
 #else
     /* Unix/Linux: Use fork+execve to execute without shell interpretation
@@ -1544,6 +1665,9 @@ static edr_status_t cmd_shell(edr_dispatcher_t *d,
 
     /* Queue output back to listener using base64 encoding */
     if (output_len > 0) {
+        dispatcher_log(d, EDR_LOG_DEBUG, "dispatcher",
+                       "[SHELL] Base64 encoding %zu bytes", output_len);
+
         /* Base64 encode output */
         static const char b64_table[] =
             "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -1565,16 +1689,26 @@ static edr_status_t cmd_shell(edr_dispatcher_t *d,
         }
         b64_output[b64_idx] = '\0';
 
+        dispatcher_log(d, EDR_LOG_DEBUG, "dispatcher",
+                       "[SHELL] Base64 encoded: %.100s...", b64_output);
+
         /* Create response payload */
         char payload[24576];
         snprintf(payload, sizeof(payload),
                  "{\"file\":\"shell_output\",\"command\":\"%s\",\"output\":\"%s\",\"bytes\":%zu}",
                  cmd, b64_output, output_len);
 
+        dispatcher_log(d, EDR_LOG_DEBUG, "dispatcher",
+                       "[SHELL] Queuing JSON payload");
+
         /* Queue message via callback if available */
         if (d->enqueue_msg_cb) {
+            dispatcher_log(d, EDR_LOG_DEBUG, "dispatcher",
+                           "[SHELL] Using enqueue_msg_cb");
             d->enqueue_msg_cb(payload);
         } else {
+            dispatcher_log(d, EDR_LOG_DEBUG, "dispatcher",
+                           "[SHELL] Using fallback local queue");
             /* Fallback: queue locally */
             pthread_mutex_lock(&d->file_queue_mu);
             if (d->file_chunk_count < 256) {
@@ -1582,14 +1716,19 @@ static edr_status_t cmd_shell(edr_dispatcher_t *d,
                 if (d->file_chunks[d->file_chunk_count]) {
                     strcpy(d->file_chunks[d->file_chunk_count], payload);
                     d->file_chunk_count++;
+                    dispatcher_log(d, EDR_LOG_DEBUG, "dispatcher",
+                                   "[SHELL] Queued at index %u", d->file_chunk_count - 1);
                 }
             }
             pthread_mutex_unlock(&d->file_queue_mu);
         }
 
         dispatcher_log(d, EDR_LOG_INFO, "dispatcher",
-                       "Shell output queued: %zu bytes encoded as base64",
+                       "[SHELL] Shell output queued: %zu bytes encoded as base64",
                        output_len);
+    } else {
+        dispatcher_log(d, EDR_LOG_WARN, "dispatcher",
+                       "[SHELL] No output captured (output_len=0)");
     }
 
     return EDR_OK;
