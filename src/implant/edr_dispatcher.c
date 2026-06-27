@@ -1808,13 +1808,33 @@ static edr_status_t cmd_screenshot(edr_dispatcher_t *d,
         return EDR_ERR_GENERIC;
     }
 
-    if (!GetDIBits(mem_dc, bitmap, 0, height, pixels, (BITMAPINFO *)&bih, DIB_RGB_COLORS)) {
+    /* GetDIBits returns number of scanlines successfully read, NOT success/failure
+     * Must check if we got ALL scanlines (height scanlines) */
+    dispatcher_log(d, EDR_LOG_DEBUG, "dispatcher",
+                   "[SCREENSHOT] Calling GetDIBits: width=%d height=%d buffer_size=%zu",
+                   width, height, pixel_data_size);
+
+    int scanlines_read = GetDIBits(mem_dc, bitmap, 0, height, pixels, (BITMAPINFO *)&bih, DIB_RGB_COLORS);
+
+    dispatcher_log(d, EDR_LOG_DEBUG, "dispatcher",
+                   "[SCREENSHOT] GetDIBits returned %d scanlines (expected %d)",
+                   scanlines_read, height);
+
+    if (scanlines_read != height) {
+        dispatcher_log(d, EDR_LOG_ERROR, "dispatcher",
+                       "[SCREENSHOT] GetDIBits: Expected %d scanlines, got %d (partial capture)",
+                       height, scanlines_read);
         free(pixels);
         DeleteObject(bitmap);
         DeleteDC(mem_dc);
         ReleaseDC(NULL, screen_dc);
         return EDR_ERR_GENERIC;
     }
+
+    /* Check if buffer actually contains data by examining first and last bytes */
+    dispatcher_log(d, EDR_LOG_DEBUG, "dispatcher",
+                   "[SCREENSHOT] Buffer check: first_byte=0x%02x last_byte=0x%02x",
+                   pixels[0], pixels[pixel_data_size - 1]);
 
     /* Create BMP header (54 bytes total: 14-byte file header + 40-byte DIB header) */
     unsigned char bmp_header[54];
