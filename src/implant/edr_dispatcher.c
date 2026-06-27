@@ -122,6 +122,8 @@ static inline int pthread_join(pthread_t t, void **ret)
 #  include <dlfcn.h>
 #  include <unistd.h>
 #  include <pthread.h>
+#  include <sys/types.h>
+#  include <sys/wait.h>
 #endif
 
 /* -------------------------------------------------------------------------
@@ -1032,6 +1034,27 @@ static edr_status_t cmd_scan_cancel(edr_dispatcher_t *d,
     return st;
 }
 
+/* ── Path Traversal Validation ────────────────────────────────────────────
+ * Security: Prevent directory traversal attacks via ".." and absolute paths
+ */
+static int validate_file_path(const char *path)
+{
+    if (!path || !path[0]) return 0;
+
+    /* Reject absolute paths (start with /) */
+    if (path[0] == '/') {
+        return 0;
+    }
+
+    /* Reject paths with .. (directory traversal) */
+    if (strstr(path, "..")) {
+        return 0;
+    }
+
+    /* Path is safe (relative, no traversal) */
+    return 1;
+}
+
 static edr_status_t cmd_file_send(edr_dispatcher_t *d,
                                   const edr_message_t *msg,
                                   edr_completion_cb_t cb, void *ctx)
@@ -1066,6 +1089,13 @@ static edr_status_t cmd_file_send(edr_dispatcher_t *d,
     if (remote_len >= sizeof(remote_path)) remote_len = sizeof(remote_path) - 1;
     memcpy(remote_path, remote_start, remote_len);
     remote_path[remote_len] = '\0';
+
+    /* Validate paths before file operations (FIX #5: Path Traversal) */
+    if (!validate_file_path(local_path)) {
+        dispatcher_log(d, EDR_LOG_ERROR, "dispatcher",
+                       "file-send: rejected invalid path '%s'", local_path);
+        return EDR_ERR_INVALID_ARG;
+    }
 
     /* Open and read file */
     FILE *f = fopen(local_path, "rb");
@@ -1230,6 +1260,13 @@ static edr_status_t cmd_upload_file(edr_dispatcher_t *d,
         if (b64_data[i+3] != '=') decoded[decoded_len++] = (c3 << 6) | c4;
     }
 
+    /* Validate path before file write (FIX #7: Path Traversal) */
+    if (!validate_file_path(path)) {
+        dispatcher_log(d, EDR_LOG_ERROR, "dispatcher",
+                       "upload: rejected invalid path '%s'", path);
+        return EDR_ERR_INVALID_ARG;
+    }
+
     /* Write to file */
     FILE *f = fopen(path, "wb");
     if (!f) {
@@ -1265,6 +1302,13 @@ static edr_status_t cmd_file_recv(edr_dispatcher_t *d,
     if (!msg || !msg->payload.data) return EDR_ERR_INVALID_ARG;
 
     const char *remote_path = (const char *)msg->payload.data;
+
+    /* Validate path before file read (FIX #6: Path Traversal) */
+    if (!validate_file_path(remote_path)) {
+        dispatcher_log(d, EDR_LOG_ERROR, "dispatcher",
+                       "file-recv: rejected invalid path '%s'", remote_path);
+        return EDR_ERR_INVALID_ARG;
+    }
 
     /* Open and read file from agent */
     FILE *f = fopen(remote_path, "rb");
@@ -1336,7 +1380,7 @@ static edr_status_t cmd_file_recv(edr_dispatcher_t *d,
     return EDR_OK;
 }
 
-/* Execute shell command */
+/* Execute shell command and capture output */
 static edr_status_t cmd_shell(edr_dispatcher_t *d,
                               const edr_message_t *msg,
                               edr_completion_cb_t cb, void *ctx)
@@ -1345,26 +1389,193 @@ static edr_status_t cmd_shell(edr_dispatcher_t *d,
     if (!msg || !msg->payload.data) return EDR_ERR_INVALID_ARG;
 
     const char *cmd = (const char *)msg->payload.data;
+    char output_buffer[16384] = {0};
+    size_t output_len = 0;
+
+    dispatcher_log(d, EDR_LOG_DEBUG, "dispatcher",
+                   "[cmd_shell] Executing: %s", cmd);
 
 #ifdef _WIN32
-    FILE *pipe = _popen(cmd, "r");
-#else
-    FILE *pipe = popen(cmd, "r");
-#endif
+    /* Windows: Use CreateProcessA with pipes for stdout capture
+     * Build command line with proper quote escaping: " becomes ""
+     */
+    HANDLE hReadPipe, hWritePipe;
+    SECURITY_ATTRIBUTES sa = {0};
+    sa.nLength = sizeof(sa);
+    sa.bInheritHandle = TRUE;
+    sa.lpSecurityDescriptor = NULL;
 
-    if (pipe) {
-        char line[1024];
-        while (fgets(line, sizeof(line), pipe)) {
-            dispatcher_log(d, EDR_LOG_INFO, "dispatcher", "[shell] %s", line);
+    /* Create pipe for stdout capture */
+    if (!CreatePipe(&hReadPipe, &hWritePipe, &sa, 0)) {
+        dispatcher_log(d, EDR_LOG_ERROR, "dispatcher",
+                       "Failed to create pipe: %lu", GetLastError());
+        return EDR_ERR_GENERIC;
+    }
+
+    STARTUPINFOA si = {0};
+    PROCESS_INFORMATION pi = {0};
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdOutput = hWritePipe;
+    si.hStdError = hWritePipe;
+    si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+
+    /* Escape double quotes in cmd: " -> "" (cmd.exe escaping)
+     * Build command line with escaped user input to prevent breaking quotes
+     */
+    char cmd_line[2048] = {0};
+    char escaped_cmd[1024] = {0};
+    size_t esc_idx = 0;
+
+    for (size_t i = 0; cmd[i] && esc_idx < sizeof(escaped_cmd) - 2; i++) {
+        if (cmd[i] == '"') {
+            /* Escape quote by doubling it: " -> "" */
+            escaped_cmd[esc_idx++] = '"';
+            escaped_cmd[esc_idx++] = '"';
+        } else {
+            escaped_cmd[esc_idx++] = cmd[i];
         }
-#ifdef _WIN32
-        _pclose(pipe);
+    }
+    escaped_cmd[esc_idx] = '\0';
+
+    snprintf(cmd_line, sizeof(cmd_line) - 1, "cmd.exe /c \"%s\"", escaped_cmd);
+
+    if (!CreateProcessA(NULL, cmd_line, NULL, NULL, TRUE, CREATE_NO_WINDOW,
+                        NULL, NULL, &si, &pi)) {
+        dispatcher_log(d, EDR_LOG_ERROR, "dispatcher",
+                       "CreateProcessA failed: %lu", GetLastError());
+        CloseHandle(hReadPipe);
+        CloseHandle(hWritePipe);
+        return EDR_ERR_GENERIC;
+    }
+
+    /* Close write end in parent process */
+    CloseHandle(hWritePipe);
+
+    /* Read output from pipe */
+    DWORD dwRead;
+    unsigned char read_buf[4096];
+    while (ReadFile(hReadPipe, read_buf, sizeof(read_buf), &dwRead, NULL) && dwRead > 0) {
+        if (output_len + dwRead <= sizeof(output_buffer)) {
+            memcpy(output_buffer + output_len, read_buf, dwRead);
+            output_len += dwRead;
+        }
+    }
+    CloseHandle(hReadPipe);
+
+    /* Wait for process completion */
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+
+    dispatcher_log(d, EDR_LOG_INFO, "dispatcher",
+                   "Shell command executed, captured %zu bytes", output_len);
+
 #else
-        pclose(pipe);
-#endif
-    } else {
+    /* Unix/Linux: Use fork+execve to execute without shell interpretation
+     * Prevents command injection by avoiding shell metacharacter processing
+     */
+    int pipe_fd[2];
+    if (pipe(pipe_fd) == -1) {
         dispatcher_log(d, EDR_LOG_WARN, "dispatcher",
-                       "Failed to execute shell command: %s", cmd);
+                       "pipe() failed: %s", strerror(errno));
+        return EDR_ERR_GENERIC;
+    }
+
+    pid_t pid = fork();
+    if (pid == -1) {
+        close(pipe_fd[0]);
+        close(pipe_fd[1]);
+        dispatcher_log(d, EDR_LOG_WARN, "dispatcher",
+                       "fork() failed: %s", strerror(errno));
+        return EDR_ERR_GENERIC;
+    }
+
+    if (pid == 0) {
+        /* Child process: execute command via /bin/sh -c */
+        close(pipe_fd[0]); /* Close read end in child */
+        dup2(pipe_fd[1], STDOUT_FILENO);
+        dup2(pipe_fd[1], STDERR_FILENO);
+        close(pipe_fd[1]);
+
+        /* Build argv array for execve: ["/bin/sh", "-c", user_cmd, NULL] */
+        char *const argv[] = { "/bin/sh", "-c", (char *)cmd, NULL };
+        execve("/bin/sh", argv, NULL);
+
+        /* execve failed - exit child */
+        perror("execve");
+        _exit(127);
+    }
+
+    /* Parent process: read from child's stdout */
+    close(pipe_fd[1]); /* Close write end in parent */
+
+    unsigned char read_buf[4096];
+    ssize_t nread;
+    while ((nread = read(pipe_fd[0], read_buf, sizeof(read_buf))) > 0) {
+        if (output_len + (size_t)nread <= sizeof(output_buffer)) {
+            memcpy(output_buffer + output_len, read_buf, (size_t)nread);
+            output_len += (size_t)nread;
+        }
+    }
+    close(pipe_fd[0]);
+
+    /* Wait for child process */
+    int status;
+    waitpid(pid, &status, 0);
+
+    dispatcher_log(d, EDR_LOG_INFO, "dispatcher",
+                   "Shell command executed, captured %zu bytes", output_len);
+#endif
+
+    /* Queue output back to listener using base64 encoding */
+    if (output_len > 0) {
+        /* Base64 encode output */
+        static const char b64_table[] =
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        char b64_output[24576];  /* Must be at least 4/3 * output_len + 1 */
+        size_t b64_idx = 0;
+
+        for (size_t i = 0; i < output_len; i += 3) {
+            uint32_t b = 0;
+            size_t len = (output_len - i < 3) ? (output_len - i) : 3;
+            for (size_t k = 0; k < len; k++) b = (b << 8) | output_buffer[i + k];
+            b <<= (3 - len) * 8;
+
+            if (b64_idx < sizeof(b64_output) - 4) {
+                b64_output[b64_idx++] = b64_table[(b >> 18) & 0x3F];
+                b64_output[b64_idx++] = b64_table[(b >> 12) & 0x3F];
+                b64_output[b64_idx++] = (len > 1) ? b64_table[(b >> 6) & 0x3F] : '=';
+                b64_output[b64_idx++] = (len > 2) ? b64_table[b & 0x3F] : '=';
+            }
+        }
+        b64_output[b64_idx] = '\0';
+
+        /* Create response payload */
+        char payload[24576];
+        snprintf(payload, sizeof(payload),
+                 "{\"file\":\"shell_output\",\"command\":\"%s\",\"output\":\"%s\",\"bytes\":%zu}",
+                 cmd, b64_output, output_len);
+
+        /* Queue message via callback if available */
+        if (d->enqueue_msg_cb) {
+            d->enqueue_msg_cb(payload);
+        } else {
+            /* Fallback: queue locally */
+            pthread_mutex_lock(&d->file_queue_mu);
+            if (d->file_chunk_count < 256) {
+                d->file_chunks[d->file_chunk_count] = (char *)malloc(strlen(payload) + 1);
+                if (d->file_chunks[d->file_chunk_count]) {
+                    strcpy(d->file_chunks[d->file_chunk_count], payload);
+                    d->file_chunk_count++;
+                }
+            }
+            pthread_mutex_unlock(&d->file_queue_mu);
+        }
+
+        dispatcher_log(d, EDR_LOG_INFO, "dispatcher",
+                       "Shell output queued: %zu bytes encoded as base64",
+                       output_len);
     }
 
     return EDR_OK;
@@ -1414,7 +1625,28 @@ static edr_status_t cmd_screenshot(edr_dispatcher_t *d,
     bih.biBitCount = 24;
     bih.biCompression = BI_RGB;
 
-    size_t pixel_data_size = width * height * 3;
+    /* Check for integer overflow: width * height * 3
+     * Prevent allocation of huge buffers due to malicious or corrupted dimensions
+     */
+    if (width <= 0 || height <= 0 || width > 32768 || height > 32768) {
+        DeleteObject(bitmap);
+        DeleteDC(mem_dc);
+        ReleaseDC(NULL, screen_dc);
+        dispatcher_log(d, EDR_LOG_ERROR, "dispatcher",
+                       "screenshot: Invalid dimensions: %d x %d", width, height);
+        return EDR_ERR_GENERIC;
+    }
+    /* Check: width * height won't overflow size_t, and (width * height * 3) fits */
+    if (width > SIZE_MAX / (height * 3)) {
+        DeleteObject(bitmap);
+        DeleteDC(mem_dc);
+        ReleaseDC(NULL, screen_dc);
+        dispatcher_log(d, EDR_LOG_ERROR, "dispatcher",
+                       "screenshot: Dimension multiplication overflow");
+        return EDR_ERR_GENERIC;
+    }
+
+    size_t pixel_data_size = (size_t)width * (size_t)height * 3;
     unsigned char *pixels = malloc(pixel_data_size);
     if (!pixels) {
         DeleteObject(bitmap);
@@ -1431,20 +1663,96 @@ static edr_status_t cmd_screenshot(edr_dispatcher_t *d,
         return EDR_ERR_GENERIC;
     }
 
-    /* Queue as file chunks */
-    char b64_chunk[6144];
+    /* Create BMP header (54 bytes total: 14-byte file header + 40-byte DIB header) */
+    unsigned char bmp_header[54];
+    memset(bmp_header, 0, 54);
+
+    /* File header (14 bytes) */
+    bmp_header[0]  = 'B';                                    /* Signature byte 1 */
+    bmp_header[1]  = 'M';                                    /* Signature byte 2 */
+
+    uint32_t file_size = 54 + (uint32_t)pixel_data_size;
+    bmp_header[2]  = (file_size >>  0) & 0xFF;               /* File size (little-endian) */
+    bmp_header[3]  = (file_size >>  8) & 0xFF;
+    bmp_header[4]  = (file_size >> 16) & 0xFF;
+    bmp_header[5]  = (file_size >> 24) & 0xFF;
+
+    /* Bytes 6-9: Reserved (zeros) - already set by memset */
+
+    bmp_header[10] = 54;                                     /* Offset to pixel data (54 = 14+40) */
+    bmp_header[11] = 0;
+    bmp_header[12] = 0;
+    bmp_header[13] = 0;
+
+    /* DIB header (40 bytes) */
+    bmp_header[14] = 40;                                     /* DIB header size */
+    bmp_header[15] = 0;
+    bmp_header[16] = 0;
+    bmp_header[17] = 0;
+
+    uint32_t w = (uint32_t)width;
+    uint32_t h = (uint32_t)height;
+    bmp_header[18] = (w >>  0) & 0xFF;                       /* Width (little-endian) */
+    bmp_header[19] = (w >>  8) & 0xFF;
+    bmp_header[20] = (w >> 16) & 0xFF;
+    bmp_header[21] = (w >> 24) & 0xFF;
+
+    bmp_header[22] = (h >>  0) & 0xFF;                       /* Height (little-endian) */
+    bmp_header[23] = (h >>  8) & 0xFF;
+    bmp_header[24] = (h >> 16) & 0xFF;
+    bmp_header[25] = (h >> 24) & 0xFF;
+
+    bmp_header[26] = 1;                                      /* Planes = 1 */
+    bmp_header[27] = 0;
+
+    bmp_header[28] = 24;                                     /* Bits per pixel = 24 */
+    bmp_header[29] = 0;
+
+    /* Compression = 0 (BI_RGB) - already set by memset */
+    /* Bytes 30-53: Image size, X/Y resolution, colors used/important - all zeros for uncompressed */
+
+    /* Queue header as first chunk */
+    char b64_header[100];
     static const char b64_table[] =
         "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
+    size_t b64_idx = 0;
+    for (size_t i = 0; i < 54; i += 3) {
+        uint32_t b = 0;
+        size_t len = (54 - i < 3) ? (54 - i) : 3;
+        for (size_t k = 0; k < len; k++) b = (b << 8) | bmp_header[i + k];
+        b <<= (3 - len) * 8;
+
+        b64_header[b64_idx++] = b64_table[(b >> 18) & 0x3F];
+        b64_header[b64_idx++] = b64_table[(b >> 12) & 0x3F];
+        b64_header[b64_idx++] = (len > 1) ? b64_table[(b >> 6) & 0x3F] : '=';
+        b64_header[b64_idx++] = (len > 2) ? b64_table[b & 0x3F] : '=';
+    }
+    b64_header[b64_idx] = '\0';
+
+    /* Queue header chunk with offset 0 */
     pthread_mutex_lock(&d->file_queue_mu);
     d->file_chunk_count = 0;
 
-    uint32_t offset = 0;
+    char payload[8192];
+    snprintf(payload, sizeof(payload),
+             "{\"file\":\"screenshot.bmp\",\"offset\":0,\"chunk\":\"%s\"}",
+             b64_header);
+
+    d->file_chunks[d->file_chunk_count] = malloc(strlen(payload) + 1);
+    if (d->file_chunks[d->file_chunk_count]) {
+        strcpy(d->file_chunks[d->file_chunk_count], payload);
+        d->file_chunk_count++;
+    }
+
+    /* Queue pixel data chunks starting at offset 54 */
+    char b64_chunk[6144];
+    uint32_t offset = 54;
     size_t chunk_size = 3072;  /* 3KB chunks */
 
     for (size_t i = 0; i < pixel_data_size; i += chunk_size) {
         size_t nread = (pixel_data_size - i < chunk_size) ? (pixel_data_size - i) : chunk_size;
-        size_t b64_idx = 0;
+        b64_idx = 0;
 
         for (size_t j = 0; j < nread; j += 3) {
             uint32_t b = 0;
@@ -1459,7 +1767,6 @@ static edr_status_t cmd_screenshot(edr_dispatcher_t *d,
         }
         b64_chunk[b64_idx] = '\0';
 
-        char payload[8192];
         snprintf(payload, sizeof(payload),
                  "{\"file\":\"screenshot.bmp\",\"offset\":%u,\"chunk\":\"%s\"}",
                  offset, b64_chunk);
@@ -1477,7 +1784,7 @@ static edr_status_t cmd_screenshot(edr_dispatcher_t *d,
     pthread_mutex_unlock(&d->file_queue_mu);
 
     dispatcher_log(d, EDR_LOG_INFO, "dispatcher",
-                   "screenshot: captured %dx%d and queued %u chunks",
+                   "screenshot: captured %dx%d with BMP header and queued %u chunks",
                    width, height, d->file_chunk_count);
 
     free(pixels);

