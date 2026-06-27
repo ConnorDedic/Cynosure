@@ -1748,28 +1748,39 @@ static edr_status_t cmd_screenshot(edr_dispatcher_t *d,
     int width = GetSystemMetrics(SM_CXSCREEN);
     int height = GetSystemMetrics(SM_CYSCREEN);
 
+    /* Dimension validation - do this FIRST before any DC creation */
+    if (width <= 0 || height <= 0 || width > 32768 || height > 32768) {
+        dispatcher_log(d, EDR_LOG_ERROR, "dispatcher",
+                       "screenshot: Invalid dimensions: %d x %d", width, height);
+        return EDR_ERR_GENERIC;
+    }
+
+    /* Check: width * height won't overflow size_t, and (width * height * 3) fits */
+    if (width > SIZE_MAX / (height * 3)) {
+        dispatcher_log(d, EDR_LOG_ERROR, "dispatcher",
+                       "screenshot: Dimension multiplication overflow");
+        return EDR_ERR_GENERIC;
+    }
+
+    size_t pixel_data_size = (size_t)width * (size_t)height * 3;
+
     /* Create device contexts */
     HDC screen_dc = GetDC(NULL);
-    if (!screen_dc) return EDR_ERR_GENERIC;
+    if (!screen_dc) {
+        dispatcher_log(d, EDR_LOG_ERROR, "dispatcher",
+                       "screenshot: GetDC(NULL) failed");
+        return EDR_ERR_GENERIC;
+    }
 
     HDC mem_dc = CreateCompatibleDC(screen_dc);
     if (!mem_dc) {
+        dispatcher_log(d, EDR_LOG_ERROR, "dispatcher",
+                       "screenshot: CreateCompatibleDC failed");
         ReleaseDC(NULL, screen_dc);
         return EDR_ERR_GENERIC;
     }
 
-    HBITMAP bitmap = CreateCompatibleBitmap(screen_dc, width, height);
-    if (!bitmap) {
-        DeleteDC(mem_dc);
-        ReleaseDC(NULL, screen_dc);
-        return EDR_ERR_GENERIC;
-    }
-
-    HBITMAP old_bitmap = SelectObject(mem_dc, bitmap);
-    BitBlt(mem_dc, 0, 0, width, height, screen_dc, 0, 0, SRCCOPY);
-    SelectObject(mem_dc, old_bitmap);
-
-    /* Get bitmap bits */
+    /* Create BITMAPINFO for DIB section */
     BITMAPINFOHEADER bih = {0};
     bih.biSize = sizeof(BITMAPINFOHEADER);
     bih.biWidth = width;
@@ -1777,92 +1788,57 @@ static edr_status_t cmd_screenshot(edr_dispatcher_t *d,
     bih.biPlanes = 1;
     bih.biBitCount = 24;
     bih.biCompression = BI_RGB;
+    bih.biSizeImage = 0;  /* For BI_RGB, can be 0 */
 
-    /* Check for integer overflow: width * height * 3
-     * Prevent allocation of huge buffers due to malicious or corrupted dimensions
-     */
-    if (width <= 0 || height <= 0 || width > 32768 || height > 32768) {
-        DeleteObject(bitmap);
-        DeleteDC(mem_dc);
-        ReleaseDC(NULL, screen_dc);
+    /* Create DIB section - gives us direct access to pixel buffer
+     * This is more reliable than CreateCompatibleBitmap + GetDIBits */
+    unsigned char *pixels = NULL;
+    HBITMAP bitmap = CreateDIBSection(mem_dc, (BITMAPINFO *)&bih, DIB_RGB_COLORS,
+                                      (void **)&pixels, NULL, 0);
+    if (!bitmap || !pixels) {
         dispatcher_log(d, EDR_LOG_ERROR, "dispatcher",
-                       "screenshot: Invalid dimensions: %d x %d", width, height);
-        return EDR_ERR_GENERIC;
-    }
-    /* Check: width * height won't overflow size_t, and (width * height * 3) fits */
-    if (width > SIZE_MAX / (height * 3)) {
-        DeleteObject(bitmap);
-        DeleteDC(mem_dc);
-        ReleaseDC(NULL, screen_dc);
-        dispatcher_log(d, EDR_LOG_ERROR, "dispatcher",
-                       "screenshot: Dimension multiplication overflow");
-        return EDR_ERR_GENERIC;
-    }
-
-    size_t pixel_data_size = (size_t)width * (size_t)height * 3;
-    unsigned char *pixels = malloc(pixel_data_size);
-    if (!pixels) {
-        DeleteObject(bitmap);
+                       "screenshot: CreateDIBSection failed");
         DeleteDC(mem_dc);
         ReleaseDC(NULL, screen_dc);
         return EDR_ERR_GENERIC;
     }
-
-    /* Windows GetDIBits pattern: must call TWICE
-     * 1. First call with NULL buffer to query/initialize header info
-     * 2. Second call with actual buffer to get the pixel bits
-     * Calling only once leaves buffer as zeros! */
 
     dispatcher_log(d, EDR_LOG_DEBUG, "dispatcher",
-                   "[SCREENSHOT] Query GetDIBits header: width=%d height=%d",
-                   width, height);
+                   "[SCREENSHOT] DIB section created: %dx%d, pixels=%p",
+                   width, height, pixels);
 
-    /* First call: NULL buffer to query header and prepare for data transfer */
-    int query_result = GetDIBits(mem_dc, bitmap, 0, height, NULL, (BITMAPINFO *)&bih, DIB_RGB_COLORS);
-    dispatcher_log(d, EDR_LOG_DEBUG, "dispatcher",
-                   "[SCREENSHOT] Query returned: %d", query_result);
+    /* Select DIB into mem_dc and copy screen */
+    HBITMAP old_bitmap = SelectObject(mem_dc, bitmap);
+    BOOL blit_result = BitBlt(mem_dc, 0, 0, width, height, screen_dc, 0, 0, SRCCOPY);
+    SelectObject(mem_dc, old_bitmap);
 
-    if (query_result == 0) {
+    if (!blit_result) {
         dispatcher_log(d, EDR_LOG_ERROR, "dispatcher",
-                       "[SCREENSHOT] GetDIBits query failed");
-        free(pixels);
+                       "screenshot: BitBlt failed");
         DeleteObject(bitmap);
         DeleteDC(mem_dc);
         ReleaseDC(NULL, screen_dc);
         return EDR_ERR_GENERIC;
     }
 
-    /* Second call: with actual buffer to get the pixel data */
     dispatcher_log(d, EDR_LOG_DEBUG, "dispatcher",
-                   "[SCREENSHOT] Reading pixel data: width=%d height=%d buffer_size=%zu",
-                   width, height, pixel_data_size);
+                   "[SCREENSHOT] BitBlt succeeded, checking pixel buffer");
 
-    int scanlines_read = GetDIBits(mem_dc, bitmap, 0, height, pixels, (BITMAPINFO *)&bih, DIB_RGB_COLORS);
-
-    dispatcher_log(d, EDR_LOG_DEBUG, "dispatcher",
-                   "[SCREENSHOT] GetDIBits returned %d scanlines (expected %d)",
-                   scanlines_read, height);
-
-    if (scanlines_read != height) {
-        dispatcher_log(d, EDR_LOG_ERROR, "dispatcher",
-                       "[SCREENSHOT] GetDIBits: Expected %d scanlines, got %d (partial capture)",
-                       height, scanlines_read);
-        free(pixels);
-        DeleteObject(bitmap);
-        DeleteDC(mem_dc);
-        ReleaseDC(NULL, screen_dc);
-        return EDR_ERR_GENERIC;
-    }
-
-    /* Verify buffer contains actual data (not zeros) */
+    /* Verify buffer contains data */
     if (pixels[0] == 0x00 && pixels[pixel_data_size - 1] == 0x00) {
         dispatcher_log(d, EDR_LOG_WARN, "dispatcher",
-                       "[SCREENSHOT] WARNING: Buffer still all zeros after GetDIBits (possible DC issue)");
+                       "[SCREENSHOT] Buffer is all zeros after BitBlt (may be empty screen)");
     } else {
         dispatcher_log(d, EDR_LOG_DEBUG, "dispatcher",
-                       "[SCREENSHOT] Buffer contains data: first_byte=0x%02x last_byte=0x%02x",
+                       "[SCREENSHOT] Pixel buffer contains data: first=0x%02x last=0x%02x",
                        pixels[0], pixels[pixel_data_size - 1]);
     }
+
+    /* With CreateDIBSection, pixels pointer already points to the actual bitmap data
+     * No need for GetDIBits - the bitmap memory is directly accessible */
+    dispatcher_log(d, EDR_LOG_DEBUG, "dispatcher",
+                   "[SCREENSHOT] Screenshot capture complete: %zu bytes captured",
+                   pixel_data_size);
 
     /* Create BMP header (54 bytes total: 14-byte file header + 40-byte DIB header) */
     unsigned char bmp_header[54];
@@ -1988,7 +1964,8 @@ static edr_status_t cmd_screenshot(edr_dispatcher_t *d,
                    "screenshot: captured %dx%d with BMP header and queued %u chunks",
                    width, height, d->file_chunk_count);
 
-    free(pixels);
+    /* Note: Do NOT free(pixels) - CreateDIBSection manages the memory.
+     * DeleteObject(bitmap) will clean up the DIB section automatically. */
     DeleteObject(bitmap);
     DeleteDC(mem_dc);
     ReleaseDC(NULL, screen_dc);
