@@ -32,8 +32,16 @@ pub struct DownloadChunk {
     pub data: Vec<u8>,
 }
 
+/// Track received chunks to detect gaps
+#[derive(Clone, Debug)]
+pub struct ChunkTracker {
+    pub total_size: u64,
+    pub chunks_received: Vec<(u64, u64)>, // (offset, length) of each received chunk
+}
+
 /// Maps agent_id -> file_path -> accumulated file data
 pub type DownloadStore = Arc<Mutex<HashMap<String, HashMap<String, Vec<u8>>>>>;
+pub type ChunkTrackerStore = Arc<Mutex<HashMap<String, HashMap<String, ChunkTracker>>>>;
 
 pub fn new_store() -> SessionStore {
     Arc::new(Mutex::new(HashMap::new()))
@@ -47,6 +55,10 @@ pub fn new_download_store() -> DownloadStore {
     Arc::new(Mutex::new(HashMap::new()))
 }
 
+pub fn new_chunk_tracker_store() -> ChunkTrackerStore {
+    Arc::new(Mutex::new(HashMap::new()))
+}
+
 pub fn queue_command(queue: &CommandQueue, agent_id: &str, command: String) {
     if let Ok(mut q) = queue.lock() {
         q.entry(agent_id.to_string())
@@ -55,9 +67,35 @@ pub fn queue_command(queue: &CommandQueue, agent_id: &str, command: String) {
     }
 }
 
+/// Check if chunks are contiguous (no gaps) from offset 0 to end
+fn chunks_are_contiguous(chunks: &[(u64, u64)]) -> bool {
+    if chunks.is_empty() {
+        return true;
+    }
+
+    let mut sorted = chunks.to_vec();
+    sorted.sort_by_key(|c| c.0);
+
+    // First chunk must start at offset 0
+    if sorted[0].0 != 0 {
+        return false;
+    }
+
+    // Each subsequent chunk must start exactly where previous ended
+    for i in 1..sorted.len() {
+        let prev_end = sorted[i - 1].0 + sorted[i - 1].1;
+        if sorted[i].0 != prev_end {
+            return false; // GAP DETECTED
+        }
+    }
+
+    true
+}
+
 /// Store a file chunk at the given offset, accumulating with previous chunks
 /// Maximum file size: 1 GB (1_073_741_824 bytes)
 /// Returns: Ok(()) on success, Err(String) on validation failure
+/// NOTE: Chunks must arrive contiguously - gaps will cause rejection
 pub fn store_download_chunk(store: &DownloadStore, agent_id: &str, file_path: &str, offset: u64, data: Vec<u8>) -> Result<(), String> {
     const MAX_FILE_SIZE: u64 = 1_073_741_824; // 1 GB
 
@@ -83,13 +121,31 @@ pub fn store_download_chunk(store: &DownloadStore, agent_id: &str, file_path: &s
     let agent_map = s.entry(agent_id.to_string()).or_insert_with(HashMap::new);
     let file_data = agent_map.entry(file_path.to_string()).or_insert_with(Vec::new);
 
-    // Expand buffer if needed, with bounds checking
-    let end_offset_usize = end_offset as usize;
-    if file_data.len() < end_offset_usize {
-        file_data.resize(end_offset_usize, 0);
+    // FIX: Do NOT zero-fill gaps - only accept contiguous chunks
+    // If this is the first chunk, it MUST start at offset 0
+    if file_data.is_empty() && offset != 0 {
+        return Err(format!(
+            "First chunk must start at offset 0, got offset {}",
+            offset
+        ));
     }
 
-    // Copy chunk data at the correct offset
+    // If buffer exists, new chunk must start exactly where buffer ends (contiguous)
+    if !file_data.is_empty() && offset != file_data.len() as u64 {
+        return Err(format!(
+            "Chunk gap detected: buffer ends at {}, chunk starts at {} (gap of {} bytes)",
+            file_data.len(),
+            offset,
+            offset as i64 - file_data.len() as i64
+        ));
+    }
+
+    // Expand buffer and copy chunk data (no zero-fill, just append contiguous data)
+    let end_offset_usize = end_offset as usize;
+    if file_data.len() < end_offset_usize {
+        file_data.resize(end_offset_usize, 0); // This only happens if buffer was empty
+    }
+
     let offset_usize = offset as usize;
     file_data[offset_usize..end_offset_usize].copy_from_slice(&data);
 
