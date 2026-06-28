@@ -26,7 +26,7 @@ all: windows
 $(OUTPUT_DIR):
 	mkdir -p $(OUTPUT_DIR)
 
-# Windows PE64 executable
+# Windows PE64 executable (DNS module built separately as DLL)
 windows: $(OUTPUT_DIR)
 	$(WINDOWS_CC) $(WINDOWS_CFLAGS) \
 		-I $(IMPLANT_DIR) \

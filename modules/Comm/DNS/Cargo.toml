@@ -1,0 +1,15 @@
+[package]
+name = "cynosure_dns_comm"
+version = "1.0.0"
+edition = "2021"
+
+[lib]
+name = "cynosure_dns_comm"
+path = "main.rs"
+crate-type = ["cdylib"]  # Compile to .dll for Windows
+
+[dependencies]
+# No Rust dependencies
+
+[build-dependencies]
+cc = "1.0"

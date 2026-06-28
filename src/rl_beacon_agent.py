@@ -36,7 +36,7 @@ RETRY_COUNTS = [1, 2, 3, 5]
 TRANSPORTS = ["vpn", "https", "dns"]
 
 STATE_DIM = 6  # hour, dow, success_rate, uptime, beacon_age, transport
-ACTION_DIM = len(BEACON_INTERVALS) * len(RETRY_COUNTS)  # 6 * 4 = 24
+ACTION_DIM = len(BEACON_INTERVALS) * len(RETRY_COUNTS) * len(TRANSPORTS)  # 6 * 4 * 3 = 72
 HIDDEN_DIM = 128
 
 LEARNING_RATE = 1e-3
@@ -128,15 +128,17 @@ class BeaconRLAgent:
                 q_values = self.q_network(state.unsqueeze(0))
                 action_idx = q_values.argmax(dim=1).item()
 
-        # Decode action to beacon params
-        beacon_interval_idx = action_idx // len(RETRY_COUNTS)
-        retry_count_idx = action_idx % len(RETRY_COUNTS)
+        # Decode action: interval + retry_count + transport (72 total actions)
+        transport_idx = action_idx // (len(BEACON_INTERVALS) * len(RETRY_COUNTS))
+        remainder = action_idx % (len(BEACON_INTERVALS) * len(RETRY_COUNTS))
+        beacon_interval_idx = remainder // len(RETRY_COUNTS)
+        retry_count_idx = remainder % len(RETRY_COUNTS)
 
         return {
             "action_idx": action_idx,
             "beacon_interval": BEACON_INTERVALS[beacon_interval_idx],
             "retry_count": RETRY_COUNTS[retry_count_idx],
-            "transport": "vpn"  # Could also be learned
+            "transport": TRANSPORTS[transport_idx]  # Now learned!
         }
 
     def compute_reward(self, beacon_success: bool, beacon_interval: int,

